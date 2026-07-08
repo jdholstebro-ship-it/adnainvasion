@@ -2,4 +2,4 @@ streamlit
 requests
 pandas
 openpyxl
-thefuzz[speedup]
+pgeocode
