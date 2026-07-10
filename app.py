@@ -44,6 +44,14 @@ CODE_LABELS = {
 TARGET_CODES = set(CODE_LABELS.keys())
 HEARING_AID_CODES = {"237700000X", "237600000X", "332S00000X"}
 
+STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA",
+    "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
+    "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX",
+    "UT", "VT", "VA", "WA", "WV", "WI", "WY", "PR",
+]
+
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -219,6 +227,48 @@ def to_record(item):
 
 
 # ------------------------------------------------------------
+# Shared post-processing (used by both search modes)
+# ------------------------------------------------------------
+
+def build_results_df(all_items):
+    records = [to_record(it) for it in all_items.values()]
+    # Keep only providers holding at least one of the four target taxonomies
+    records = [r for r in records if r["Matched_Codes"]]
+    df = pd.DataFrame(records)
+    if not df.empty:
+        # Chain grouping: parent org if present, else normalized org name
+        df["Chain_Group"] = df["Parent_Organization"].apply(normalize_org_name)
+        df["Chain_Group"] = df["Chain_Group"].fillna(df["Organization_Name"].apply(normalize_org_name))
+        chain_sizes = df.groupby("Chain_Group")["NPI"].transform("count")
+        df["Chain_Size"] = chain_sizes.where(df["Chain_Group"].notna(), 1).astype(int)
+        df.loc[df["Chain_Size"] >= 3, "Prospect_Score"] += 15
+    return df
+
+
+@st.cache_data(ttl=21600, show_spinner=False)  # cache each state for 6h
+def fetch_state_orgs(state_code, wildcard):
+    """All NPI-2 records for one state+wildcard. Returns (items, hit_cap)."""
+    results, skip = [], 0
+    while True:
+        params = {
+            "version": "2.1",
+            "taxonomy_description": wildcard,
+            "enumeration_type": "NPI-2",
+            "state": state_code,
+            "limit": 200,
+            "skip": skip,
+        }
+        batch = fetch_page(params)
+        results.extend(batch)
+        if len(batch) < 200:
+            return results, False
+        if skip >= 1000:
+            return results, True
+        skip += 200
+        time.sleep(0.4)
+
+
+# ------------------------------------------------------------
 # Sidebar — search inputs
 # ------------------------------------------------------------
 st.sidebar.header("Search")
@@ -238,6 +288,16 @@ st.sidebar.caption(
 
 search_clicked = st.sidebar.button("🔍 Search NPPES", type="primary")
 
+st.sidebar.divider()
+st.sidebar.subheader("🆕 Nationwide shortcut")
+new_days = st.sidebar.selectbox("New organizations in the past…", [30, 60, 90, 180], index=2,
+                                format_func=lambda d: f"{d} days")
+st.sidebar.caption(
+    "Sweeps every state for newly registered NPI-2 organizations. "
+    "First run takes a few minutes; results are cached for 6 hours."
+)
+national_clicked = st.sidebar.button("Find new NPI-2s nationwide")
+
 # ------------------------------------------------------------
 # Run search (results persist in session_state)
 # ------------------------------------------------------------
@@ -254,25 +314,41 @@ if search_clicked:
                     capped_queries.append(wc)
                 for it in items:
                     all_items[it.get("number")] = it  # dedupe by NPI
+
         status_area.empty()
-
-        records = [to_record(it) for it in all_items.values()]
-        # Keep only providers holding at least one of the four target taxonomies
-        records = [r for r in records if r["Matched_Codes"]]
-        df = pd.DataFrame(records)
-
-        if not df.empty:
-            # Chain grouping: parent org if present, else normalized org name
-            df["Chain_Group"] = df["Parent_Organization"].apply(normalize_org_name)
-            df["Chain_Group"] = df["Chain_Group"].fillna(df["Organization_Name"].apply(normalize_org_name))
-            chain_sizes = df.groupby("Chain_Group")["NPI"].transform("count")
-            df["Chain_Size"] = chain_sizes.where(df["Chain_Group"].notna(), 1).astype(int)
-            df.loc[df["Chain_Size"] >= 3, "Prospect_Score"] += 15
-
-        st.session_state["results_df"] = df
+        st.session_state["results_df"] = build_results_df(all_items)
         st.session_state["capped"] = capped_queries
+        st.session_state["mode"] = "search"
     except RuntimeError as e:
         status_area.empty()
+        st.error(str(e))
+
+if national_clicked:
+    all_items, capped_states = {}, []
+    progress = st.progress(0.0, text="Sweeping states for new NPI-2 organizations…")
+    try:
+        total = len(STATES) * len(SEARCH_WILDCARDS)
+        step = 0
+        for st_code in STATES:
+            for wc in SEARCH_WILDCARDS:
+                step += 1
+                progress.progress(step / total, text=f"Checking {st_code} ({wc}) — {step}/{total}")
+                items, hit_cap = fetch_state_orgs(st_code, wc)
+                if hit_cap:
+                    capped_states.append(f"{st_code}/{wc}")
+                for it in items:
+                    all_items[it.get("number")] = it
+        progress.empty()
+
+        df = build_results_df(all_items)
+        if not df.empty:
+            df = df[df["Days_Since_Opened"].notna() & (df["Days_Since_Opened"] <= new_days)]
+        st.session_state["results_df"] = df.reset_index(drop=True)
+        st.session_state["capped"] = capped_states
+        st.session_state["mode"] = "national_new"
+        st.session_state["national_days"] = new_days
+    except RuntimeError as e:
+        progress.empty()
         st.error(str(e))
 
 # ------------------------------------------------------------
@@ -283,9 +359,25 @@ if "results_df" in st.session_state:
     capped = st.session_state.get("capped", [])
 
     if df.empty:
-        st.warning("No matching providers. Try a different state or remove the city/ZIP filter.")
+        if st.session_state.get("mode") == "national_new":
+            st.warning(f"No new NPI-2 organizations found in the past "
+                       f"{st.session_state.get('national_days', 90)} days.")
+        else:
+            st.warning("No matching providers. Try a different state or remove the city/ZIP filter.")
     else:
-        st.success(f"✅ {len(df):,} unique providers with hearing-related taxonomies found")
+        if st.session_state.get("mode") == "national_new":
+            nd = st.session_state.get("national_days", 90)
+            st.success(f"🆕 {len(df):,} new NPI-2 organizations registered nationwide in the past {nd} days")
+            by_state = (
+                df.groupby("State")
+                .agg(New_Orgs=("NPI", "count"),
+                     Newest=("Enumeration_Date", "max"))
+                .sort_values("New_Orgs", ascending=False)
+            )
+            st.markdown("**New organizations by state:**")
+            st.dataframe(by_state, height=min(420, 40 + 35 * len(by_state)))
+        else:
+            st.success(f"✅ {len(df):,} unique providers with hearing-related taxonomies found")
         if capped:
             st.warning(
                 f"Result cap (~1,200) hit for: {', '.join(capped)}. "
@@ -339,7 +431,7 @@ if "results_df" in st.session_state:
         multi = chains[chains["Locations_Found"] >= 2]
         if not multi.empty:
             st.markdown(f"**{len(multi)}** groups with 2+ NPIs in these results:")
-            st.dataframe(multi.head(25), use_container_width=True)
+            st.dataframe(multi.head(25))
             pick = st.selectbox("Drill into a chain", ["(all)"] + multi.index.tolist())
             if pick != "(all)":
                 f = f[f["Chain_Group"] == pick]
@@ -348,21 +440,29 @@ if "results_df" in st.session_state:
 
         # --- Optional map via ZIP centroids (API provides no coordinates) ---
         with st.expander("📍 Map (approximate, by ZIP code)"):
-            try:
-                import pgeocode
-                nomi = pgeocode.Nominatim("us")
-                zips = f["ZIP"].dropna().unique()
-                if len(zips) > 0:
-                    geo = nomi.query_postal_code(list(zips))[["postal_code", "latitude", "longitude"]]
-                    geo = geo.rename(columns={"postal_code": "ZIP"})
-                    m = f.merge(geo, on="ZIP", how="left").dropna(subset=["latitude", "longitude"])
-                    if not m.empty:
-                        st.map(m[["latitude", "longitude"]])
-                        st.caption("Pins are ZIP-code centroids — NPPES does not publish exact coordinates.")
-                    else:
-                        st.info("No mappable ZIPs in the current results.")
-            except Exception:
-                st.info("Map unavailable (pgeocode not installed or ZIP lookup failed).")
+            if st.checkbox("Load map", help="Downloads a ZIP-code lookup table on first use"):
+                @st.cache_data(show_spinner="Loading ZIP coordinate data…")
+                def zip_coords(zips_tuple):
+                    import pgeocode
+                    nomi = pgeocode.Nominatim("us")
+                    geo = nomi.query_postal_code(list(zips_tuple))[
+                        ["postal_code", "latitude", "longitude"]
+                    ]
+                    return geo.rename(columns={"postal_code": "ZIP"})
+
+                try:
+                    zips = tuple(sorted(f["ZIP"].dropna().unique()))
+                    if zips:
+                        m = f.merge(zip_coords(zips), on="ZIP", how="left").dropna(
+                            subset=["latitude", "longitude"]
+                        )
+                        if not m.empty:
+                            st.map(m[["latitude", "longitude"]])
+                            st.caption("Pins are ZIP-code centroids — NPPES does not publish exact coordinates.")
+                        else:
+                            st.info("No mappable ZIPs in the current results.")
+                except Exception:
+                    st.info("Map unavailable (ZIP lookup download failed on this host).")
 
         # --- Results table ---
         st.subheader(f"📋 {len(f):,} qualified prospects")
@@ -375,7 +475,6 @@ if "results_df" in st.session_state:
         ]
         st.dataframe(
             f[show_cols].sort_values(["Prospect_Score", "Total_Locations"], ascending=False),
-            use_container_width=True,
             hide_index=True,
         )
 
