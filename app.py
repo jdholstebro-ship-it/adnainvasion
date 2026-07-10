@@ -1,3 +1,4 @@
+import hashlib
 import io
 import re
 import time
@@ -269,6 +270,46 @@ def fetch_state_orgs(state_code, wildcard):
 
 
 # ------------------------------------------------------------
+# Hunter.io email enrichment (optional, credit-metered)
+# ------------------------------------------------------------
+
+def _hunter_request(company, api_key):
+    """One Hunter Domain Search call by company name. Returns parsed dict."""
+    resp = requests.get(
+        "https://api.hunter.io/v2/domain-search",
+        params={"company": company, "api_key": api_key, "limit": 5},
+        timeout=20,
+    )
+    if resp.status_code == 401:
+        raise RuntimeError("Hunter.io rejected the API key (401). Check the key in your app secrets.")
+    if resp.status_code == 429:
+        raise RuntimeError("Hunter.io rate limit reached (429). Try again later or reduce batch size.")
+    data = resp.json().get("data") or {}
+    emails = []
+    for e in data.get("emails", []) or []:
+        val = e.get("value")
+        if val:
+            conf = e.get("confidence")
+            emails.append(f"{val} ({conf}%)" if conf is not None else val)
+    return {
+        "domain": data.get("domain"),
+        "company_found": data.get("organization"),
+        "emails": "; ".join(emails) or None,
+    }
+
+
+@st.cache_data(ttl=604800, show_spinner=False)  # cache 7 days — each lookup costs a credit
+def hunter_lookup(company, _api_key):
+    """Cached wrapper (api key excluded from the cache key via underscore prefix)."""
+    try:
+        return _hunter_request(company, _api_key)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        return {"domain": None, "company_found": None, "emails": None, "error": str(e)}
+
+
+# ------------------------------------------------------------
 # Sidebar — search inputs
 # ------------------------------------------------------------
 st.sidebar.header("Search")
@@ -464,7 +505,7 @@ if "results_df" in st.session_state:
                 except Exception:
                     st.info("Map unavailable (ZIP lookup download failed on this host).")
 
-        # --- Results table ---
+        # --- Results table with row selection ---
         st.subheader(f"📋 {len(f):,} qualified prospects")
         show_cols = [
             "Prospect_Score", "Name", "Total_Locations", "Chain_Size", "Type",
@@ -473,34 +514,181 @@ if "results_df" in st.session_state:
             "Website_or_URL", "Direct_Address",
             "Primary_Taxonomy", "Taxonomy_Codes", "NPI",
         ]
-        st.dataframe(
-            f[show_cols].sort_values(["Prospect_Score", "Total_Locations"], ascending=False),
+
+        if "selected_npis" not in st.session_state:
+            st.session_state["selected_npis"] = set()
+        if "sel_nonce" not in st.session_state:
+            st.session_state["sel_nonce"] = 0
+
+        f_sorted = f.sort_values(
+            ["Prospect_Score", "Total_Locations"], ascending=False
+        ).reset_index(drop=True)
+        visible_npis = f_sorted["NPI"].tolist()
+
+        b1, b2, b3 = st.columns([1, 1, 2])
+        with b1:
+            if st.button("✅ Select all"):
+                st.session_state["selected_npis"] |= set(visible_npis)
+                st.session_state["sel_nonce"] += 1
+        with b2:
+            if st.button("⬜ Clear selection"):
+                st.session_state["selected_npis"] -= set(visible_npis)
+                st.session_state["sel_nonce"] += 1
+
+        table = f_sorted[show_cols].copy()
+        table.insert(0, "Select", f_sorted["NPI"].isin(st.session_state["selected_npis"]))
+
+        key_sig = hashlib.md5(",".join(map(str, visible_npis)).encode()).hexdigest()[:10]
+        edited = st.data_editor(
+            table,
             hide_index=True,
+            disabled=show_cols,  # only the Select checkbox is editable
+            column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+            key=f"prospect_editor_{st.session_state['sel_nonce']}_{key_sig}",
         )
+        # Sync ticked rows back into the persistent, NPI-keyed selection set
+        sel_now = set(edited.loc[edited["Select"], "NPI"])
+        st.session_state["selected_npis"] = (
+            st.session_state["selected_npis"] - set(visible_npis)
+        ) | sel_now
+        n_sel = len(st.session_state["selected_npis"] & set(visible_npis))
+        with b3:
+            st.markdown(f"**{n_sel}** of {len(f_sorted)} rows selected")
+
+        # --- Hunter.io email enrichment ---
+        st.subheader("📧 Email enrichment (Hunter.io)")
+        hunter_key = None
+        try:
+            hunter_key = st.secrets.get("HUNTER_API_KEY")
+        except Exception:
+            pass
+        if not hunter_key:
+            hunter_key = st.text_input(
+                "Hunter.io API key", type="password",
+                help="Better: store it once in Streamlit Cloud → app Settings → Secrets as "
+                     'HUNTER_API_KEY = "your-key" so you never paste it again.',
+            )
+
+        orgs_only = f[(f["Type"] == "NPI-2") & f["Organization_Name"].notna()]
+        hc1, hc2 = st.columns([1, 2])
+        with hc1:
+            max_enrich = st.slider("Orgs to enrich (top by score)", 5, 50, 20, step=5,
+                                   help="Each org costs 1 Hunter search credit (cached 7 days).")
+        with hc2:
+            st.caption(f"{len(orgs_only):,} organizations in the current filtered results are eligible. "
+                       "Individual providers (NPI-1) are skipped — Hunter works on companies.")
+
+        if st.button("Find emails", disabled=not hunter_key):
+            targets = orgs_only.sort_values("Prospect_Score", ascending=False).head(max_enrich)
+            enriched = st.session_state.get("hunter", {})
+            prog = st.progress(0.0, text="Querying Hunter.io…")
+            try:
+                for i, (_, row) in enumerate(targets.iterrows(), 1):
+                    prog.progress(i / len(targets), text=f"Hunter.io: {row['Organization_Name'][:40]} ({i}/{len(targets)})")
+                    enriched[row["NPI"]] = hunter_lookup(row["Organization_Name"], hunter_key)
+                st.session_state["hunter"] = enriched
+            except RuntimeError as e:
+                st.error(str(e))
+            prog.empty()
+
+        hunter_data = st.session_state.get("hunter", {})
+        if hunter_data:
+            f["Hunter_Domain"] = f["NPI"].map(lambda n: (hunter_data.get(n) or {}).get("domain"))
+            f["Hunter_Company_Match"] = f["NPI"].map(lambda n: (hunter_data.get(n) or {}).get("company_found"))
+            f["Hunter_Emails"] = f["NPI"].map(lambda n: (hunter_data.get(n) or {}).get("emails"))
+            found = f["Hunter_Emails"].notna().sum()
+            st.markdown(f"**Emails found for {found} of {len(hunter_data)} enriched organizations:**")
+            st.dataframe(
+                f[f["NPI"].isin(hunter_data.keys())][
+                    ["Name", "City", "State", "Hunter_Company_Match", "Hunter_Domain", "Hunter_Emails"]
+                ],
+                hide_index=True,
+            )
+            st.caption("⚠️ Verify Hunter_Company_Match against the clinic name — generic names can "
+                       "resolve to the wrong company. Confidence % shown per email.")
 
         # --- Exports ---
         st.subheader("📤 Export")
-        export_df = f.drop(columns=["Matched_Codes"], errors="ignore")
-        e1, e2 = st.columns(2)
-        stamp = datetime.now().strftime("%Y%m%d")
-        with e1:
-            st.download_button(
-                "Download CSV",
-                export_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"hearing_aid_prospects_{stamp}.csv",
-                mime="text/csv",
-            )
-        with e2:
+        sel_set = st.session_state.get("selected_npis", set()) & set(visible_npis)
+        scope = st.radio(
+            "Rows to export",
+            [f"All filtered rows ({len(f_sorted)})", f"Selected rows only ({len(sel_set)})"],
+            horizontal=True,
+        )
+        use_selected = scope.startswith("Selected")
+        if use_selected and not sel_set:
+            st.info("No rows selected yet — tick rows in the table above or use ✅ Select all.")
+
+        exp_base = f_sorted[f_sorted["NPI"].isin(sel_set)] if use_selected else f_sorted
+
+        enrich = st.checkbox(
+            "Look up emails via Hunter.io before export",
+            disabled=not hunter_key,
+            help="NPI-2 organizations only; 1 search credit per uncached lookup (cached 7 days)."
+                 + ("" if hunter_key else " Add your Hunter API key above to enable."),
+        )
+        if enrich:
+            org_mask = (exp_base["Type"] == "NPI-2") & exp_base["Organization_Name"].notna()
+            cached = st.session_state.get("hunter", {})
+            n_new = sum(1 for n in exp_base.loc[org_mask, "NPI"] if n not in cached)
+            st.caption(f"Will look up {org_mask.sum()} organizations "
+                       f"(~{n_new} new Hunter credits; the rest come from cache).")
+
+        if st.button("⚙️ Prepare export", disabled=(use_selected and not sel_set)):
+            exp = exp_base.drop(columns=["Matched_Codes"], errors="ignore").copy()
+
+            if enrich and hunter_key:
+                enriched = st.session_state.get("hunter", {})
+                orgs = exp[(exp["Type"] == "NPI-2") & exp["Organization_Name"].notna()]
+                prog = st.progress(0.0, text="Hunter.io lookups…")
+                try:
+                    for i, (_, row) in enumerate(orgs.iterrows(), 1):
+                        prog.progress(i / max(len(orgs), 1),
+                                      text=f"Hunter.io: {str(row['Organization_Name'])[:40]} ({i}/{len(orgs)})")
+                        if row["NPI"] not in enriched:
+                            enriched[row["NPI"]] = hunter_lookup(row["Organization_Name"], hunter_key)
+                    st.session_state["hunter"] = enriched
+                except RuntimeError as e:
+                    st.error(str(e))
+                prog.empty()
+
+            hunter_data = st.session_state.get("hunter", {})
+            if hunter_data:
+                exp["Hunter_Domain"] = exp["NPI"].map(lambda n: (hunter_data.get(n) or {}).get("domain"))
+                exp["Hunter_Company_Match"] = exp["NPI"].map(lambda n: (hunter_data.get(n) or {}).get("company_found"))
+                exp["Hunter_Emails"] = exp["NPI"].map(lambda n: (hunter_data.get(n) or {}).get("emails"))
+
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                export_df.to_excel(writer, index=False, sheet_name="Prospects")
+                exp.to_excel(writer, index=False, sheet_name="Prospects")
             buf.seek(0)
-            st.download_button(
-                "Download Excel (.xlsx)",
-                buf,
-                file_name=f"hearing_aid_prospects_{stamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.session_state["export_pkg"] = {
+                "csv": exp.to_csv(index=False).encode("utf-8"),
+                "xlsx": buf.getvalue(),
+                "n": len(exp),
+                "stamp": datetime.now().strftime("%Y%m%d_%H%M"),
+                "enriched": bool(enrich and hunter_key),
+            }
+
+        pkg = st.session_state.get("export_pkg")
+        if pkg:
+            st.markdown(f"Export ready: **{pkg['n']} rows**"
+                        + (" — includes Hunter email columns" if pkg["enriched"] else ""))
+            e1, e2 = st.columns(2)
+            with e1:
+                st.download_button(
+                    "Download CSV",
+                    pkg["csv"],
+                    file_name=f"hearing_aid_prospects_{pkg['stamp']}.csv",
+                    mime="text/csv",
+                )
+            with e2:
+                st.download_button(
+                    "Download Excel (.xlsx)",
+                    pkg["xlsx"],
+                    file_name=f"hearing_aid_prospects_{pkg['stamp']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 else:
     st.info("👈 Pick a state (recommended) and click **Search NPPES**. Provider-type filtering happens after the search, instantly.")
 
