@@ -120,6 +120,21 @@ def run_search(wildcard, enum_type, state, city, postal_code, status_area):
     return results, hit_cap
 
 
+def freshness_flag(days_since_open, last_updated):
+    """Classify record vitality. New registrations are prospects, not ghosts —
+    identical enum/update dates only imply staleness when the record is OLD."""
+    if days_since_open is not None and days_since_open <= 365:
+        return "New Business"
+    if pd.isna(last_updated):
+        return "Unknown"
+    age_days = (datetime.now() - last_updated).days
+    if age_days <= 730:
+        return "Active"
+    if age_days <= 1825:
+        return "Aging"
+    return "Stale - verify"
+
+
 def to_record(item):
     basic = item.get("basic", {})
     addresses = item.get("addresses", []) or []
@@ -138,6 +153,22 @@ def to_record(item):
 
     tax_codes = {t.get("code") for t in taxonomies if t.get("code")}
     primary_tax = next((t for t in taxonomies if t.get("primary")), taxonomies[0] if taxonomies else {})
+
+    # Endpoints: orgs can optionally list website/FHIR URLs and Direct
+    # secure-messaging addresses. Sparse, but free signal when present.
+    endpoints = item.get("endpoints", []) or []
+    urls, directs = [], []
+    for e in endpoints:
+        ep = (e.get("endpoint") or "").strip()
+        etype = (e.get("endpointType") or e.get("endpoint_type") or "").upper()
+        if not ep:
+            continue
+        if ep.lower().startswith("http") or "URL" in etype or "WEBSITE" in etype:
+            urls.append(ep)
+        elif "@" in ep:
+            directs.append(ep)
+    urls = list(dict.fromkeys(urls))
+    directs = list(dict.fromkeys(directs))
 
     org_name = basic.get("organization_name")
     parent = basic.get("parent_organization_legal_business_name")
@@ -168,6 +199,7 @@ def to_record(item):
         "Enumeration_Date": enum_date.strftime("%Y-%m-%d") if pd.notna(enum_date) else None,
         "Days_Since_Opened": days_since,
         "Last_Updated": last_updated.strftime("%Y-%m-%d") if pd.notna(last_updated) else None,
+        "Record_Freshness": freshness_flag(days_since, last_updated),
         "State": primary_addr.get("state"),
         "City": primary_addr.get("city"),
         "ZIP": (primary_addr.get("postal_code") or "")[:5] or None,
@@ -176,6 +208,8 @@ def to_record(item):
                                f"{basic.get('authorized_official_last_name', '')}".strip() or None,
         "Authorized_Official_Title": basic.get("authorized_official_title_or_position"),
         "Authorized_Official_Phone": basic.get("authorized_official_telephone_number"),
+        "Website_or_URL": "; ".join(urls) or None,
+        "Direct_Address": "; ".join(directs) or None,
         "Taxonomy_Codes": ", ".join(sorted(tax_codes)),
         "Matched_Codes": tax_codes & TARGET_CODES,  # set, used for filtering
         "Primary_Taxonomy": primary_tax.get("desc"),
@@ -334,8 +368,9 @@ if "results_df" in st.session_state:
         st.subheader(f"📋 {len(f):,} qualified prospects")
         show_cols = [
             "Prospect_Score", "Name", "Total_Locations", "Chain_Size", "Type",
-            "Enumeration_Date", "Last_Updated", "City", "State", "ZIP", "Phone",
+            "Record_Freshness", "Enumeration_Date", "Last_Updated", "City", "State", "ZIP", "Phone",
             "Authorized_Official", "Authorized_Official_Title", "Authorized_Official_Phone",
+            "Website_or_URL", "Direct_Address",
             "Primary_Taxonomy", "Taxonomy_Codes", "NPI",
         ]
         st.dataframe(
