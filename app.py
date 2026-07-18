@@ -538,7 +538,7 @@ if "results_df" in st.session_state:
             with exc1:
                 excluded_ops = st.multiselect(
                     "🚫 Exclude these operators from the prospect list",
-                    options=multi.index.tolist(),
+                    options=sorted(multi.index.tolist()),
                     key="excluded_operators",
                     help="Pick franchise brands or whales you don't want in the "
                          "qualified list, table, or exports.",
@@ -560,7 +560,7 @@ if "results_df" in st.session_state:
             if n_excluded:
                 st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
 
-            pick = st.selectbox("Drill into a chain", ["(all)"] + multi.index.tolist())
+            pick = st.selectbox("Drill into a chain", ["(all)"] + sorted(multi.index.tolist()))
             if pick != "(all)":
                 f = f[f["Chain_Group"] == pick]
         else:
