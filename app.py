@@ -94,39 +94,83 @@ def fetch_page(params, retries=3):
     return []
 
 
-def run_search(wildcard, enum_type, state, city, postal_code, status_area):
-    """Paginate one wildcard query. skip is capped at 1000 => max ~1,200 rows per query."""
-    results = []
-    skip = 0
-    hit_cap = False
+def _paged_fetch(base_params):
+    """Paginate one query. Returns (results, hit_cap)."""
+    results, skip = [], 0
     while True:
-        params = {
-            "version": "2.1",
-            "taxonomy_description": wildcard,
-            "limit": 200,
-            "skip": skip,
-        }
-        if enum_type:
-            params["enumeration_type"] = enum_type  # must be exactly NPI-1 or NPI-2
-        if state:
-            params["state"] = state
-        if city:
-            params["city"] = city
-        if postal_code:
-            params["postal_code"] = postal_code
-
-        status_area.write(f"Fetching '{wildcard}' … {len(results)} records so far")
+        params = dict(base_params, limit=200, skip=skip)
         batch = fetch_page(params)
         results.extend(batch)
-
         if len(batch) < 200:
-            break
+            return results, False
         if skip >= 1000:  # API hard cap
-            hit_cap = True
-            break
+            return results, True
         skip += 200
-        time.sleep(0.5)  # polite rate limiting
-    return results, hit_cap
+        time.sleep(0.5)
+
+
+def _harvest(base_params, status_area=None, label="", zip_prefix="", max_depth=4):
+    """
+    Fetch all records for a query. If the API's ~1,200 cap is hit,
+    recursively subdivide by ZIP prefix until every slice fits.
+    Returns (items_dict, still_capped).
+    """
+    p = dict(base_params)
+    if zip_prefix:
+        p["postal_code"] = zip_prefix + "*"
+    if status_area is not None:
+        status_area.write(f"Fetching {label}" + (f" — ZIP {zip_prefix}*" if zip_prefix else "") + " …")
+
+    results, capped = _paged_fetch(p)
+    items = {r.get("number"): r for r in results if r.get("number")}
+    if not capped:
+        return items, False
+    if len(zip_prefix) >= max_depth:
+        return items, True  # give up subdividing; report residual cap
+
+    # Derive which ZIP digits actually occur from what we've seen,
+    # then probe the remaining digits too so nothing rare is missed.
+    seen = set()
+    for r in items.values():
+        for a in r.get("addresses", []) or []:
+            z = a.get("postal_code") or ""
+            if z.startswith(zip_prefix) and len(z) > len(zip_prefix):
+                seen.add(z)
+    if not zip_prefix:  # API wildcard needs 2+ chars, so start at 2-digit prefixes
+        prefixes = sorted({z[:2] for z in seen if len(z) >= 2})
+        prefixes += [f"{i:02d}" for i in range(100) if f"{i:02d}" not in prefixes]
+    else:
+        nxt = sorted({z[len(zip_prefix)] for z in seen})
+        prefixes = [zip_prefix + d for d in nxt]
+        prefixes += [zip_prefix + d for d in "0123456789" if zip_prefix + d not in prefixes]
+
+    still = False
+    for pref in prefixes:
+        time.sleep(0.3)
+        sub, s = _harvest(base_params, status_area, label, pref, max_depth)
+        items.update(sub)
+        still = still or s
+    return items, still
+
+
+def run_search(wildcard, enum_type, state, city, postal_code, status_area):
+    """One wildcard query with automatic cap subdivision (unless the user
+    already filters by postal code, which conflicts with subdividing)."""
+    base = {"version": "2.1", "taxonomy_description": wildcard}
+    if enum_type:
+        base["enumeration_type"] = enum_type  # must be exactly NPI-1 or NPI-2
+    if state:
+        base["state"] = state
+    if city:
+        base["city"] = city
+
+    if postal_code:  # user-specified ZIP filter: no subdivision possible
+        base["postal_code"] = postal_code
+        results, capped = _paged_fetch(base)
+        return results, capped
+
+    items, capped = _harvest(base, status_area, f"'{wildcard}'")
+    return list(items.values()), capped
 
 
 def freshness_flag(days_since_open, last_updated):
@@ -231,7 +275,7 @@ def to_record(item):
 # Shared post-processing (used by both search modes)
 # ------------------------------------------------------------
 
-def build_results_df(all_items):
+def build_results_df(all_items, strict=False):
     records = [to_record(it) for it in all_items.values()]
     # Keep only providers holding at least one of the four target taxonomies
     records = [r for r in records if r["Matched_Codes"]]
@@ -240,6 +284,12 @@ def build_results_df(all_items):
         # Chain grouping: parent org if present, else normalized org name
         df["Chain_Group"] = df["Parent_Organization"].apply(normalize_org_name)
         df["Chain_Group"] = df["Chain_Group"].fillna(df["Organization_Name"].apply(normalize_org_name))
+        if strict:
+            # Strict mode: same name AND same authorized official.
+            # Splits generic-name coincidences and franchise brands into
+            # per-owner operators (which is what a "prospect" really is).
+            off = df["Authorized_Official"].fillna("").str.strip().str.upper()
+            df["Chain_Group"] = df["Chain_Group"] + " | " + off
         chain_sizes = df.groupby("Chain_Group")["NPI"].transform("count")
         df["Chain_Size"] = chain_sizes.where(df["Chain_Group"].notna(), 1).astype(int)
         # Total locations across the whole operator (chain group), catching both
@@ -253,25 +303,16 @@ def build_results_df(all_items):
 
 @st.cache_data(ttl=21600, show_spinner=False)  # cache each state for 6h
 def fetch_state_orgs(state_code, wildcard):
-    """All NPI-2 records for one state+wildcard. Returns (items, hit_cap)."""
-    results, skip = [], 0
-    while True:
-        params = {
-            "version": "2.1",
-            "taxonomy_description": wildcard,
-            "enumeration_type": "NPI-2",
-            "state": state_code,
-            "limit": 200,
-            "skip": skip,
-        }
-        batch = fetch_page(params)
-        results.extend(batch)
-        if len(batch) < 200:
-            return results, False
-        if skip >= 1000:
-            return results, True
-        skip += 200
-        time.sleep(0.4)
+    """All NPI-2 records for one state+wildcard, with automatic cap
+    subdivision by ZIP prefix. Returns (items, still_capped)."""
+    base = {
+        "version": "2.1",
+        "taxonomy_description": wildcard,
+        "enumeration_type": "NPI-2",
+        "state": state_code,
+    }
+    items, capped = _harvest(base)
+    return list(items.values()), capped
 
 
 # ------------------------------------------------------------
@@ -290,6 +331,14 @@ st.sidebar.caption(
     "The app searches broadly (Hearing*, Audiolog*) and then filters to exact "
     "taxonomy codes. The API returns at most ~1,200 records per query — for "
     "national coverage, run once per state."
+)
+
+strict_grouping = st.sidebar.checkbox(
+    "Strict operator grouping", value=True,
+    help="Group records into one operator only when the organization name AND "
+         "the authorized official match. Prevents unrelated same-name clinics "
+         "and franchise brands from merging into fake mega-chains. Untick for "
+         "the looser name-only grouping.",
 )
 
 search_clicked = st.sidebar.button("🔍 Search NPPES", type="primary")
@@ -351,7 +400,7 @@ if search_clicked:
                     all_items[it.get("number")] = it  # dedupe by NPI
 
         status_area.empty()
-        st.session_state["results_df"] = build_results_df(all_items)
+        st.session_state["results_df"] = build_results_df(all_items, strict=strict_grouping)
         st.session_state["capped"] = capped_queries
         st.session_state["mode"] = "search"
     except RuntimeError as e:
@@ -361,7 +410,7 @@ if search_clicked:
 if national_clicked:
     try:
         all_items, capped_states = sweep_nationwide_orgs()
-        df = build_results_df(all_items)
+        df = build_results_df(all_items, strict=strict_grouping)
         if not df.empty:
             df = df[df["Days_Since_Opened"].notna() & (df["Days_Since_Opened"] <= new_days)]
         st.session_state["results_df"] = df.reset_index(drop=True)
@@ -374,7 +423,7 @@ if national_clicked:
 if multi_clicked:
     try:
         all_items, capped_states = sweep_nationwide_orgs()
-        df = build_results_df(all_items)
+        df = build_results_df(all_items, strict=strict_grouping)
         if not df.empty:
             df = df[df["Group_Locations"] >= multi_threshold]
         st.session_state["results_df"] = df.reset_index(drop=True)
@@ -473,15 +522,44 @@ if "results_df" in st.session_state:
             f[f["Chain_Group"].notna()]
             .groupby("Chain_Group")
             .agg(
-                Locations_Found=("NPI", "count"),
+                NPIs=("NPI", "count"),
+                Group_Locations=("Group_Locations", "max"),
                 States=("State", lambda s: ", ".join(sorted(set(s.dropna())))),
             )
-            .sort_values("Locations_Found", ascending=False)
+            .sort_values("Group_Locations", ascending=False)
         )
-        multi = chains[chains["Locations_Found"] >= 2]
+        multi = chains[chains["NPIs"] >= 2]
         if not multi.empty:
             st.markdown(f"**{len(multi)}** groups with 2+ NPIs in these results:")
             st.dataframe(multi.head(25))
+
+            # --- Exclusions: remove whales/franchises from the prospect list ---
+            exc1, exc2, exc3 = st.columns([2, 1, 1])
+            with exc1:
+                excluded_ops = st.multiselect(
+                    "🚫 Exclude these operators from the prospect list",
+                    options=multi.index.tolist(),
+                    key="excluded_operators",
+                    help="Pick franchise brands or whales you don't want in the "
+                         "qualified list, table, or exports.",
+                )
+            with exc2:
+                exclude_big = st.checkbox("Auto-exclude operators over…",
+                                          key="exclude_big")
+            with exc3:
+                big_cutoff = st.number_input("locations", min_value=5, max_value=2000,
+                                             value=50, step=5, key="big_cutoff",
+                                             disabled=not exclude_big)
+
+            before_exc = len(f)
+            if excluded_ops:
+                f = f[~f["Chain_Group"].isin(excluded_ops)]
+            if exclude_big:
+                f = f[f["Group_Locations"] <= big_cutoff]
+            n_excluded = before_exc - len(f)
+            if n_excluded:
+                st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
+
             pick = st.selectbox("Drill into a chain", ["(all)"] + multi.index.tolist())
             if pick != "(all)":
                 f = f[f["Chain_Group"] == pick]
