@@ -242,6 +242,11 @@ def build_results_df(all_items):
         df["Chain_Group"] = df["Chain_Group"].fillna(df["Organization_Name"].apply(normalize_org_name))
         chain_sizes = df.groupby("Chain_Group")["NPI"].transform("count")
         df["Chain_Size"] = chain_sizes.where(df["Chain_Group"].notna(), 1).astype(int)
+        # Total locations across the whole operator (chain group), catching both
+        # one-NPI-many-locations and many-NPIs-one-location-each structures
+        grp_loc = df.groupby("Chain_Group")["Total_Locations"].transform("sum")
+        df["Group_Locations"] = grp_loc.where(df["Chain_Group"].notna(),
+                                              df["Total_Locations"]).astype(int)
         df.loc[df["Chain_Size"] >= 3, "Prospect_Score"] += 15
     return df
 
@@ -299,6 +304,35 @@ st.sidebar.caption(
 )
 national_clicked = st.sidebar.button("Find new NPI-2s nationwide")
 
+st.sidebar.subheader("🏢 Multi-location operators")
+multi_threshold = st.sidebar.selectbox("Operator size", [2, 3, 5, 10], index=2,
+                                       format_func=lambda n: f"{n}+ locations")
+st.sidebar.caption(
+    "Finds organizations whose combined locations across their chain group "
+    "meet the threshold. Uses the same cached nationwide sweep."
+)
+multi_clicked = st.sidebar.button("Find multi-location orgs nationwide")
+
+
+def sweep_nationwide_orgs():
+    """Sweep every state for NPI-2 records (cached per state for 6h)."""
+    all_items, capped = {}, []
+    progress = st.progress(0.0, text="Sweeping states for NPI-2 organizations…")
+    total = len(STATES) * len(SEARCH_WILDCARDS)
+    step = 0
+    for st_code in STATES:
+        for wc in SEARCH_WILDCARDS:
+            step += 1
+            progress.progress(step / total, text=f"Checking {st_code} ({wc}) — {step}/{total}")
+            items, hit_cap = fetch_state_orgs(st_code, wc)
+            if hit_cap:
+                capped.append(f"{st_code}/{wc}")
+            for it in items:
+                all_items[it.get("number")] = it
+    progress.empty()
+    return all_items, capped
+
+
 # ------------------------------------------------------------
 # Run search (results persist in session_state)
 # ------------------------------------------------------------
@@ -325,22 +359,8 @@ if search_clicked:
         st.error(str(e))
 
 if national_clicked:
-    all_items, capped_states = {}, []
-    progress = st.progress(0.0, text="Sweeping states for new NPI-2 organizations…")
     try:
-        total = len(STATES) * len(SEARCH_WILDCARDS)
-        step = 0
-        for st_code in STATES:
-            for wc in SEARCH_WILDCARDS:
-                step += 1
-                progress.progress(step / total, text=f"Checking {st_code} ({wc}) — {step}/{total}")
-                items, hit_cap = fetch_state_orgs(st_code, wc)
-                if hit_cap:
-                    capped_states.append(f"{st_code}/{wc}")
-                for it in items:
-                    all_items[it.get("number")] = it
-        progress.empty()
-
+        all_items, capped_states = sweep_nationwide_orgs()
         df = build_results_df(all_items)
         if not df.empty:
             df = df[df["Days_Since_Opened"].notna() & (df["Days_Since_Opened"] <= new_days)]
@@ -349,7 +369,19 @@ if national_clicked:
         st.session_state["mode"] = "national_new"
         st.session_state["national_days"] = new_days
     except RuntimeError as e:
-        progress.empty()
+        st.error(str(e))
+
+if multi_clicked:
+    try:
+        all_items, capped_states = sweep_nationwide_orgs()
+        df = build_results_df(all_items)
+        if not df.empty:
+            df = df[df["Group_Locations"] >= multi_threshold]
+        st.session_state["results_df"] = df.reset_index(drop=True)
+        st.session_state["capped"] = capped_states
+        st.session_state["mode"] = "national_multi"
+        st.session_state["multi_threshold"] = multi_threshold
+    except RuntimeError as e:
         st.error(str(e))
 
 # ------------------------------------------------------------
@@ -363,6 +395,9 @@ if "results_df" in st.session_state:
         if st.session_state.get("mode") == "national_new":
             st.warning(f"No new NPI-2 organizations found in the past "
                        f"{st.session_state.get('national_days', 90)} days.")
+        elif st.session_state.get("mode") == "national_multi":
+            st.warning(f"No operators found with "
+                       f"{st.session_state.get('multi_threshold', 5)}+ locations.")
         else:
             st.warning("No matching providers. Try a different state or remove the city/ZIP filter.")
     else:
@@ -377,6 +412,20 @@ if "results_df" in st.session_state:
             )
             st.markdown("**New organizations by state:**")
             st.dataframe(by_state, height=min(420, 40 + 35 * len(by_state)))
+        elif st.session_state.get("mode") == "national_multi":
+            th = st.session_state.get("multi_threshold", 5)
+            n_ops = df["Chain_Group"].nunique()
+            st.success(f"🏢 {n_ops:,} operators with {th}+ locations nationwide "
+                       f"({len(df):,} NPI-2 records)")
+            by_op = (
+                df.groupby("Chain_Group")
+                .agg(Locations=("Group_Locations", "max"),
+                     NPIs=("NPI", "count"),
+                     States=("State", lambda s: ", ".join(sorted(set(s.dropna())))))
+                .sort_values("Locations", ascending=False)
+            )
+            st.markdown("**Operators by size:**")
+            st.dataframe(by_op, height=min(420, 40 + 35 * min(len(by_op), 25)))
         else:
             st.success(f"✅ {len(df):,} unique providers with hearing-related taxonomies found")
         if capped:
@@ -468,7 +517,7 @@ if "results_df" in st.session_state:
         # --- Results table with row selection ---
         st.subheader(f"📋 {len(f):,} qualified prospects")
         show_cols = [
-            "Prospect_Score", "Name", "Total_Locations", "Chain_Size", "Type",
+            "Prospect_Score", "Name", "Total_Locations", "Chain_Size", "Group_Locations", "Type",
             "Record_Freshness", "Enumeration_Date", "Last_Updated", "City", "State", "ZIP", "Phone",
             "Authorized_Official", "Authorized_Official_Title", "Authorized_Official_Phone",
             "Website_or_URL", "Direct_Address",
