@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
+import re
 import time
 from datetime import datetime
 from thefuzz import process
@@ -25,6 +26,7 @@ taxonomy = taxonomy_options[selected_tax]
 enumeration_type = st.sidebar.selectbox("Entity Type", ["Both", "Individual (NPI-1)", "Organization (NPI-2)"])
 
 org_name = st.sidebar.text_input("Organization Name (optional, use * for wildcard)")
+official_search = st.sidebar.text_input("Authorized Official (optional, use * for wildcard)")
 state = st.sidebar.text_input("State (e.g. CA, TX, FL)", max_chars=2).upper()
 city = st.sidebar.text_input("City (optional)")
 postal_code = st.sidebar.text_input("ZIP Code (optional)")
@@ -37,6 +39,24 @@ include_all = st.sidebar.checkbox("Include older providers", value=True)
 min_locations = st.sidebar.slider("Minimum Locations", 1, 20, 2)   # Default 2+ for your ideal customer
 
 search_button = st.sidebar.button("🔍 Search Hearing Aid Providers", type="primary")
+
+
+def wildcard_to_regex(pattern):
+    """Convert a user wildcard pattern (using *) into a case-insensitive regex.
+    A pattern with no * is treated as 'contains'."""
+    pattern = pattern.strip()
+    if not pattern:
+        return None
+    # Escape everything, then turn the escaped \* back into .*
+    escaped = re.escape(pattern).replace(r"\*", ".*")
+    if "*" not in pattern:
+        # No wildcard: match anywhere in the string (contains)
+        regex = escaped
+    else:
+        # Wildcard given: anchor to the start so 'hear*' means 'starts with hear'
+        regex = "^" + escaped
+    return re.compile(regex, re.IGNORECASE)
+
 
 if search_button:
     with st.spinner("Querying NPPES Registry..."):
@@ -78,15 +98,22 @@ if search_button:
                 addresses = item.get("addresses", [])
                 practice_locs = item.get("practice_locations", [])
                 taxonomies = item.get("taxonomies", [])
+                other_names = item.get("other_names", [])
 
                 primary_addr = next((a for a in addresses if a.get("address_purpose") == "LOCATION"),
                                   addresses[0] if addresses else {})
+
+                # DBA / other names: NPPES returns a list of {organization_name, type, code}
+                dba_names = [o.get("organization_name") for o in other_names if o.get("organization_name")]
+                dba_name = "; ".join(dba_names) if dba_names else None
 
                 enum_date = pd.to_datetime(basic.get("enumeration_date"), errors='coerce')
                 last_updated = pd.to_datetime(basic.get("last_updated"), errors='coerce')
                 days_since = (datetime.now() - enum_date).days if pd.notna(enum_date) else None
 
                 total_locations = 1 + len(practice_locs)
+
+                official_name = f"{basic.get('authorized_official_first_name','')} {basic.get('authorized_official_last_name','')}".strip()
 
                 # Simple Prospect Score (higher = better fit for your software)
                 score = 0
@@ -100,6 +127,7 @@ if search_button:
                     "Entity_Type": "Organization (NPI-2)" if item.get("enumeration_type") == "NPI-2" else "Individual (NPI-1)",
                     "Name": basic.get("organization_name") or f"{basic.get('first_name','')} {basic.get('last_name','')}".strip(),
                     "Organization_Name": basic.get("organization_name"),
+                    "DBA_Name": dba_name,
                     "Parent_Organization": basic.get("parent_organization_legal_business_name"),
                     "Total_Locations": total_locations,
                     "Enumeration_Date": enum_date.strftime('%Y-%m-%d') if pd.notna(enum_date) else None,
@@ -109,7 +137,7 @@ if search_button:
                     "City": primary_addr.get("city"),
                     "ZIP": primary_addr.get("postal_code"),
                     "Phone": primary_addr.get("telephone_number"),
-                    "Authorized_Official": f"{basic.get('authorized_official_first_name','')} {basic.get('authorized_official_last_name','')}".strip(),
+                    "Authorized_Official": official_name,
                     "Authorized_Official_Title": basic.get("authorized_official_title_or_position"),
                     "Authorized_Official_Phone": basic.get("authorized_official_telephone_number"),
                     "EIN": basic.get("ein"),
@@ -127,11 +155,20 @@ if search_button:
                 df = df[df["Days_Since_Opened"] <= days_back]
             df = df[df["Total_Locations"] >= min_locations]
 
+            # Authorized Official filter (client-side, supports * wildcard)
+            official_regex = wildcard_to_regex(official_search)
+            if official_regex is not None:
+                df = df[df["Authorized_Official"].fillna("").apply(lambda x: bool(official_regex.search(x)))]
+
+            # Group_Locations: how many NPIs share the same chain (parent, falling back to legal name)
+            df["Chain_Group"] = df["Parent_Organization"].fillna(df["Organization_Name"])
+            group_sizes = df.groupby("Chain_Group")["NPI"].transform("count")
+            df["Group_Locations"] = group_sizes
+
             st.success(f"✅ Found **{len(df)}** qualified hearing aid providers")
 
             # Chain Detection (Exact + Fuzzy)
             st.subheader("🔗 Chain Detection")
-            df["Chain_Group"] = df["Parent_Organization"].fillna(df["Organization_Name"])
             if len(df) > 5:
                 org_names = df["Chain_Group"].dropna().unique()
                 df["Fuzzy_Chain"] = df["Chain_Group"].apply(
@@ -147,20 +184,44 @@ if search_button:
             else:
                 st.info("No coordinates available.")
 
-            # Results Table
-            display_cols = ["NPI", "Name", "Entity_Type", "Total_Locations", "Prospect_Score", "Chain_Group",
+            # Results Table with row selection
+            st.subheader("📋 Results")
+            st.caption("Tick the rows you want to export. If you select none, all rows are exported.")
+
+            display_cols = ["NPI", "Name", "DBA_Name", "Entity_Type", "Total_Locations",
+                           "Group_Locations", "Prospect_Score", "Chain_Group",
                            "Enumeration_Date", "Last_Updated", "City", "State", "Phone",
                            "Authorized_Official", "Authorized_Official_Title"]
 
-            st.dataframe(
-                df[display_cols].sort_values("Prospect_Score", ascending=False),
+            display_df = df[display_cols].sort_values(
+                ["Prospect_Score", "Group_Locations"], ascending=False
+            ).reset_index(drop=True)
+
+            selection = st.dataframe(
+                display_df,
                 use_container_width=True,
                 hide_index=True,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key="results_table",
                 column_config={
                     "Prospect_Score": st.column_config.NumberColumn("Prospect Score (0-85)"),
-                    "Total_Locations": st.column_config.NumberColumn("Locations"),
+                    "Total_Locations": st.column_config.NumberColumn("Locations (this NPI)"),
+                    "Group_Locations": st.column_config.NumberColumn("Chain Size (NPIs)"),
+                    "DBA_Name": st.column_config.TextColumn("DBA / Other Name"),
                 }
             )
+
+            # Determine which rows to export
+            selected_rows = selection.selection.rows if selection and selection.selection else []
+            if selected_rows:
+                # Map the selected display rows back to the full df via NPI
+                selected_npis = display_df.iloc[selected_rows]["NPI"].tolist()
+                export_df = df[df["NPI"].isin(selected_npis)]
+                st.info(f"{len(export_df)} row(s) selected for export.")
+            else:
+                export_df = df
+                st.info("No rows selected — all rows will be exported.")
 
             # === EXPORTS ===
             st.subheader("📤 Export Prospects")
@@ -168,7 +229,7 @@ if search_button:
             col1, col2 = st.columns(2)
 
             with col1:
-                csv = df.to_csv(index=False).encode('utf-8')
+                csv = export_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 Download CSV",
                     data=csv,
@@ -180,7 +241,7 @@ if search_button:
                 # Excel Download using BytesIO
                 buffer = pd.io.common.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Hearing Aid Prospects')
+                    export_df.to_excel(writer, index=False, sheet_name='Hearing Aid Prospects')
                 buffer.seek(0)
 
                 st.download_button(
