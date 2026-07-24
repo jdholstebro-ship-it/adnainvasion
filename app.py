@@ -341,6 +341,21 @@ def build_results_df(all_items, strict=False):
         grp_loc = df.groupby("Chain_Group")["Total_Locations"].transform("sum")
         df["Group_Locations"] = grp_loc.where(df["Chain_Group"].notna(),
                                               df["Total_Locations"]).astype(int)
+
+        # Multi-state operator: does this record's chain group span 2+ states?
+        # Keyed on Chain_Group so it lines up with the chain table and the
+        # exclusion filters. Records with no chain group (e.g. lone individuals)
+        # can't be assessed, so they are treated as single-state (False).
+        def _states_for_group(sub):
+            return ", ".join(sorted(s for s in sub.dropna().unique()))
+        grp_states = df.groupby("Chain_Group")["State"].transform(_states_for_group)
+        df["Operating_States"] = grp_states.where(df["Chain_Group"].notna(),
+                                                  df["State"].fillna(""))
+        state_counts = df.groupby("Chain_Group")["State"].transform("nunique")
+        df["Multi_State_Operator"] = (
+            df["Chain_Group"].notna() & (state_counts >= 2)
+        )
+
         df.loc[df["Chain_Size"] >= 3, "Prospect_Score"] += 15
     return df
 
@@ -596,6 +611,18 @@ if "results_df" in st.session_state:
             .sort_values("Group_Locations", ascending=False)
         )
         multi = chains[chains["NPIs"] >= 2]
+        # --- DBA exclusion (works even when no multi-NPI chains exist) ---
+        dba_present = sorted(f["DBA_Name"].dropna().unique().tolist()) if "DBA_Name" in f.columns else []
+        excluded_dbas = []
+        if dba_present:
+            excluded_dbas = st.multiselect(
+                "🚫 Exclude these DBA / trade names from the prospect list",
+                options=dba_present,
+                key="excluded_dbas",
+                help="Knock out storefront/franchise brands by their 'doing business "
+                     "as' name, even when the underlying legal names differ.",
+            )
+
         if not multi.empty:
             st.markdown(f"**{len(multi)}** groups with 2+ NPIs in these results:")
             st.dataframe(multi.head(25))
@@ -623,6 +650,8 @@ if "results_df" in st.session_state:
                 f = f[~f["Chain_Group"].isin(excluded_ops)]
             if exclude_big:
                 f = f[f["Group_Locations"] <= big_cutoff]
+            if excluded_dbas:
+                f = f[~f["DBA_Name"].isin(excluded_dbas)]
             n_excluded = before_exc - len(f)
             if n_excluded:
                 st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
@@ -631,6 +660,13 @@ if "results_df" in st.session_state:
             if pick != "(all)":
                 f = f[f["Chain_Group"] == pick]
         else:
+            # No multi-NPI chains, but DBA exclusion may still apply.
+            if excluded_dbas:
+                before_exc = len(f)
+                f = f[~f["DBA_Name"].isin(excluded_dbas)]
+                n_excluded = before_exc - len(f)
+                if n_excluded:
+                    st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
             st.info("No multi-NPI groups detected in the current filtered set.")
 
         # --- Optional map via ZIP centroids (API provides no coordinates) ---
@@ -662,7 +698,8 @@ if "results_df" in st.session_state:
         # --- Results table with row selection ---
         st.subheader(f"📋 {len(f):,} qualified prospects")
         show_cols = [
-            "Prospect_Score", "Name", "DBA_Name", "Total_Locations", "Chain_Size", "Group_Locations", "Type",
+            "Prospect_Score", "Name", "DBA_Name", "Total_Locations", "Chain_Size", "Group_Locations",
+            "Multi_State_Operator", "Operating_States", "Type",
             "Record_Freshness", "Enumeration_Date", "Last_Updated", "City", "State", "ZIP", "Phone",
             "Authorized_Official", "Authorized_Official_Title", "Authorized_Official_Phone",
             "Website_or_URL", "Direct_Address",
