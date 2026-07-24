@@ -97,6 +97,7 @@ if search_button:
 
                 record = {
                     "NPI": item.get("number"),
+                    "Entity_Type": "Organization (NPI-2)" if item.get("enumeration_type") == "NPI-2" else "Individual (NPI-1)",
                     "Name": basic.get("organization_name") or f"{basic.get('first_name','')} {basic.get('last_name','')}".strip(),
                     "Organization_Name": basic.get("organization_name"),
                     "Parent_Organization": basic.get("parent_organization_legal_business_name"),
@@ -147,7 +148,7 @@ if search_button:
                 st.info("No coordinates available.")
 
             # Results Table
-            display_cols = ["NPI", "Name", "Total_Locations", "Prospect_Score", "Chain_Group",
+            display_cols = ["NPI", "Name", "Entity_Type", "Total_Locations", "Prospect_Score", "Chain_Group",
                            "Enumeration_Date", "Last_Updated", "City", "State", "Phone",
                            "Authorized_Official", "Authorized_Official_Title"]
 
