@@ -83,13 +83,21 @@ def normalize_org_name(name):
 
 def wildcard_to_regex(pattern):
     """Convert a user wildcard pattern (using *) into a case-insensitive regex.
-    No * -> 'contains' match. With * -> anchored at the start ('starts with')."""
+
+    `*` means 'any run of characters'. The match is UNANCHORED (via re.search),
+    so the pattern is found anywhere in the target string:
+        NEIL      -> matches 'JOHN NEIL'      (plain substring / contains)
+        NEIL*     -> matches 'JOHN NEIL'      ('NEIL' then anything, incl. nothing)
+        *NEIL     -> matches 'JOHN NEIL'      (anything then 'NEIL')
+        JOHN*NEIL -> matches 'JOHN A NEIL'    ('JOHN', anything, 'NEIL')
+    This is intentionally forgiving: names are stored 'FIRST LAST', so anchoring
+    to the start would make a last-name wildcard like NEIL* fail. Users who want
+    strict start/end anchoring can type ^ or $ themselves."""
     pattern = (pattern or "").strip()
     if not pattern:
         return None
     escaped = re.escape(pattern).replace(r"\*", ".*")
-    regex = escaped if "*" not in pattern else "^" + escaped
-    return re.compile(regex, re.IGNORECASE)
+    return re.compile(escaped, re.IGNORECASE)
 
 
 def fetch_page(params, retries=3):
