@@ -1,701 +1,198 @@
-import hashlib
-import io
-import re
+import streamlit as st
+import requests
+import pandas as pd
 import time
 from datetime import datetime
-
-import pandas as pd
-import requests
-import streamlit as st
-
-# ============================================================
-# Hearing Aid Clinic Prospect Finder — NPPES NPI Registry
-#
-# v3 fixes:
-#  - Taxonomy search now uses WILDCARDS ("Hearing*", "Audiolog*").
-#    The API's exact-description matching is unreliable (e.g. the
-#    registry's own description for 332S00000X contains a double
-#    space: "Hearing  Aid Equipment"). Wildcards sidestep this;
-#    precision comes from filtering taxonomy CODES client-side.
-#  - Locations array is returned as "practiceLocations" (camelCase),
-#    not "practice_locations" as documented. Both keys handled.
-#  - Results persist via st.session_state; provider-type selection
-#    is applied client-side, so changing it does NOT require re-search.
-# ============================================================
+from thefuzz import process
 
 st.set_page_config(page_title="Hearing Aid Clinic Prospect Finder", layout="wide")
 st.title("🦻 Hearing Aid Clinic Prospect Finder")
-st.markdown(
-    "Find **hearing aid selling & fitting practices** in the NPPES NPI Registry, "
-    "detect chains/common ownership, and surface recently opened, multi-location prospects."
-)
+st.markdown("**Targeted for multi-location hearing aid sellers & fitters** — Ideal prospects for practice management software (scheduling, AI notes, resource optimization).")
 
-API_URL = "https://npiregistry.cms.hhs.gov/api/"
+# Sidebar
+st.sidebar.header("Search Filters")
 
-# Wildcard queries sent to the API (broad, reliable)
-SEARCH_WILDCARDS = ["Hearing*", "Audiolog*"]
-
-# Precise filtering happens here, by NUCC taxonomy code
-CODE_LABELS = {
-    "237700000X": "Hearing Instrument Specialist",
-    "237600000X": "Audiologist-Hearing Aid Fitter",
-    "332S00000X": "Hearing Aid Equipment Supplier",
-    "231H00000X": "Audiologist (many dispense aids)",
+taxonomy_options = {
+    "Audiologist-Hearing Aid Fitter (237600000X)": "237600000X",
+    "Hearing Instrument Specialist (237700000X)": "237700000X",
+    "Hearing Aid Equipment Supplier (332S00000X)": "332S00000X",
+    "Any Hearing Aid Related": "Hearing*"
 }
-TARGET_CODES = set(CODE_LABELS.keys())
-HEARING_AID_CODES = {"237700000X", "237600000X", "332S00000X"}
 
-STATES = [
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA",
-    "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
-    "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX",
-    "UT", "VT", "VA", "WA", "WV", "WI", "WY", "PR",
-]
+selected_tax = st.sidebar.selectbox("Provider Type (Hearing Aid Focused)", options=list(taxonomy_options.keys()))
+taxonomy = taxonomy_options[selected_tax]
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+enumeration_type = st.sidebar.selectbox("Entity Type", ["Both", "Individual (NPI-1)", "Organization (NPI-2)"])
 
-SUFFIX_RE = re.compile(
-    r"\b(LLC|L\.L\.C\.|INC|INCORPORATED|PLLC|P\.?C\.?|LTD|LLP|CORP(ORATION)?|CO|PA|P\.A\.)\b\.?",
-    re.IGNORECASE,
-)
+org_name = st.sidebar.text_input("Organization Name (optional, use * for wildcard)")
+state = st.sidebar.text_input("State (e.g. CA, TX, FL)", max_chars=2).upper()
+city = st.sidebar.text_input("City (optional)")
+postal_code = st.sidebar.text_input("ZIP Code (optional)")
 
-def normalize_org_name(name):
-    """Normalize so 'ABC Hearing, LLC' and 'ABC HEARING INC.' group together."""
-    if not name or not isinstance(name, str):
-        return None
-    n = name.upper()
-    n = SUFFIX_RE.sub("", n)
-    n = re.sub(r"[^A-Z0-9 ]", " ", n)
-    n = re.sub(r"\s+", " ", n).strip()
-    return n or None
+max_results = st.sidebar.slider("Maximum Results", 100, 2000, 800, step=100)
 
+st.sidebar.subheader("Prospect Filters")
+days_back = st.sidebar.slider("Opened in last X days", 30, 730, 365, step=30)
+include_all = st.sidebar.checkbox("Include older providers", value=True)
+min_locations = st.sidebar.slider("Minimum Locations", 1, 20, 2)   # Default 2+ for your ideal customer
 
-def fetch_page(params, retries=3):
-    """One API call with retry/backoff for throttling."""
-    for attempt in range(retries):
-        try:
-            resp = requests.get(API_URL, params=params, timeout=20)
-            if resp.status_code in (429, 503):
-                time.sleep(3 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            if "Errors" in data:
-                msgs = "; ".join(e.get("description", "") for e in data["Errors"])
-                raise RuntimeError(f"NPPES API error on query '{params.get('taxonomy_description')}': {msgs}")
-            return data.get("results", [])
-        except requests.RequestException as e:
-            if attempt == retries - 1:
-                raise RuntimeError(f"Network error: {e}")
-            time.sleep(2)
-    return []
+search_button = st.sidebar.button("🔍 Search Hearing Aid Providers", type="primary")
 
+if search_button:
+    with st.spinner("Querying NPPES Registry..."):
+        params = {
+            "version": "2.1",
+            "taxonomy_description": taxonomy,
+            "limit": 200,
+            "skip": 0
+        }
 
-def _paged_fetch(base_params):
-    """Paginate one query. Returns (results, hit_cap)."""
-    results, skip = [], 0
-    while True:
-        params = dict(base_params, limit=200, skip=skip)
-        batch = fetch_page(params)
-        results.extend(batch)
-        if len(batch) < 200:
-            return results, False
-        if skip >= 1000:  # API hard cap
-            return results, True
-        skip += 200
-        time.sleep(0.5)
+        if enumeration_type != "Both":
+            params["enumeration_type"] = enumeration_type.replace(" (NPI-1)", "").replace(" (NPI-2)", "")
 
+        if org_name: params["organization_name"] = org_name
+        if state: params["state"] = state
+        if city: params["city"] = city
+        if postal_code: params["postal_code"] = postal_code
 
-def _harvest(base_params, status_area=None, label="", zip_prefix="", max_depth=4):
-    """
-    Fetch all records for a query. If the API's ~1,200 cap is hit,
-    recursively subdivide by ZIP prefix until every slice fits.
-    Returns (items_dict, still_capped).
-    """
-    p = dict(base_params)
-    if zip_prefix:
-        p["postal_code"] = zip_prefix + "*"
-    if status_area is not None:
-        status_area.write(f"Fetching {label}" + (f" — ZIP {zip_prefix}*" if zip_prefix else "") + " …")
+        all_results = []
+        skip = 0
+        while len(all_results) < max_results:
+            params["skip"] = skip
+            try:
+                resp = requests.get("https://npiregistry.cms.hhs.gov/api/", params=params, timeout=20)
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+                all_results.extend(results)
+                if len(results) < 200: break
+                skip += 200
+                time.sleep(0.7)
+            except Exception as e:
+                st.error(f"API Error: {e}")
+                break
 
-    results, capped = _paged_fetch(p)
-    items = {r.get("number"): r for r in results if r.get("number")}
-    if not capped:
-        return items, False
-    if len(zip_prefix) >= max_depth:
-        return items, True  # give up subdividing; report residual cap
+        if all_results:
+            records = []
+            for item in all_results:
+                basic = item.get("basic", {})
+                addresses = item.get("addresses", [])
+                practice_locs = item.get("practice_locations", [])
+                taxonomies = item.get("taxonomies", [])
 
-    # Derive which ZIP digits actually occur from what we've seen,
-    # then probe the remaining digits too so nothing rare is missed.
-    seen = set()
-    for r in items.values():
-        for a in r.get("addresses", []) or []:
-            z = a.get("postal_code") or ""
-            if z.startswith(zip_prefix) and len(z) > len(zip_prefix):
-                seen.add(z)
-    if not zip_prefix:  # API wildcard needs 2+ chars, so start at 2-digit prefixes
-        prefixes = sorted({z[:2] for z in seen if len(z) >= 2})
-        prefixes += [f"{i:02d}" for i in range(100) if f"{i:02d}" not in prefixes]
-    else:
-        nxt = sorted({z[len(zip_prefix)] for z in seen})
-        prefixes = [zip_prefix + d for d in nxt]
-        prefixes += [zip_prefix + d for d in "0123456789" if zip_prefix + d not in prefixes]
+                primary_addr = next((a for a in addresses if a.get("address_purpose") == "LOCATION"),
+                                  addresses[0] if addresses else {})
 
-    still = False
-    for pref in prefixes:
-        time.sleep(0.3)
-        sub, s = _harvest(base_params, status_area, label, pref, max_depth)
-        items.update(sub)
-        still = still or s
-    return items, still
+                enum_date = pd.to_datetime(basic.get("enumeration_date"), errors='coerce')
+                last_updated = pd.to_datetime(basic.get("last_updated"), errors='coerce')
+                days_since = (datetime.now() - enum_date).days if pd.notna(enum_date) else None
 
+                total_locations = 1 + len(practice_locs)
 
-def run_search(wildcard, enum_type, state, city, postal_code, status_area):
-    """One wildcard query with automatic cap subdivision (unless the user
-    already filters by postal code, which conflicts with subdividing)."""
-    base = {"version": "2.1", "taxonomy_description": wildcard}
-    if enum_type:
-        base["enumeration_type"] = enum_type  # must be exactly NPI-1 or NPI-2
-    if state:
-        base["state"] = state
-    if city:
-        base["city"] = city
+                # Simple Prospect Score (higher = better fit for your software)
+                score = 0
+                if total_locations >= 3: score += 50
+                elif total_locations >= 2: score += 30
+                if days_since and days_since < 365: score += 20
+                if last_updated and (datetime.now() - last_updated).days < 180: score += 15
 
-    if postal_code:  # user-specified ZIP filter: no subdivision possible
-        base["postal_code"] = postal_code
-        results, capped = _paged_fetch(base)
-        return results, capped
+                record = {
+                    "NPI": item.get("number"),
+                    "Name": basic.get("organization_name") or f"{basic.get('first_name','')} {basic.get('last_name','')}".strip(),
+                    "Organization_Name": basic.get("organization_name"),
+                    "Parent_Organization": basic.get("parent_organization_legal_business_name"),
+                    "Total_Locations": total_locations,
+                    "Enumeration_Date": enum_date.strftime('%Y-%m-%d') if pd.notna(enum_date) else None,
+                    "Days_Since_Opened": days_since,
+                    "Last_Updated": last_updated.strftime('%Y-%m-%d') if pd.notna(last_updated) else None,
+                    "State": primary_addr.get("state"),
+                    "City": primary_addr.get("city"),
+                    "ZIP": primary_addr.get("postal_code"),
+                    "Phone": primary_addr.get("telephone_number"),
+                    "Authorized_Official": f"{basic.get('authorized_official_first_name','')} {basic.get('authorized_official_last_name','')}".strip(),
+                    "Authorized_Official_Title": basic.get("authorized_official_title_or_position"),
+                    "Authorized_Official_Phone": basic.get("authorized_official_telephone_number"),
+                    "EIN": basic.get("ein"),
+                    "Primary_Taxonomy": next((t.get("desc") for t in taxonomies if t.get("primary")), ""),
+                    "Prospect_Score": score,
+                    "Latitude": primary_addr.get("latitude"),
+                    "Longitude": primary_addr.get("longitude"),
+                }
+                records.append(record)
 
-    items, capped = _harvest(base, status_area, f"'{wildcard}'")
-    return list(items.values()), capped
+            df = pd.DataFrame(records)
 
+            # Apply filters
+            if not include_all:
+                df = df[df["Days_Since_Opened"] <= days_back]
+            df = df[df["Total_Locations"] >= min_locations]
 
-def freshness_flag(days_since_open, last_updated):
-    """Classify record vitality. New registrations are prospects, not ghosts —
-    identical enum/update dates only imply staleness when the record is OLD."""
-    if days_since_open is not None and days_since_open <= 365:
-        return "New Business"
-    if pd.isna(last_updated):
-        return "Unknown"
-    age_days = (datetime.now() - last_updated).days
-    if age_days <= 730:
-        return "Active"
-    if age_days <= 1825:
-        return "Aging"
-    return "Stale - verify"
+            st.success(f"✅ Found **{len(df)}** qualified hearing aid providers")
 
-
-def to_record(item):
-    basic = item.get("basic", {})
-    addresses = item.get("addresses", []) or []
-    # API actually returns camelCase "practiceLocations" (docs say practice_locations)
-    practice_locs = item.get("practiceLocations") or item.get("practice_locations") or []
-    taxonomies = item.get("taxonomies", []) or []
-
-    primary_addr = next(
-        (a for a in addresses if a.get("address_purpose") == "LOCATION"),
-        addresses[0] if addresses else {},
-    )
-
-    enum_date = pd.to_datetime(basic.get("enumeration_date"), errors="coerce")
-    last_updated = pd.to_datetime(basic.get("last_updated"), errors="coerce")
-    days_since = (datetime.now() - enum_date).days if pd.notna(enum_date) else None
-
-    tax_codes = {t.get("code") for t in taxonomies if t.get("code")}
-    primary_tax = next((t for t in taxonomies if t.get("primary")), taxonomies[0] if taxonomies else {})
-
-    # Endpoints: orgs can optionally list website/FHIR URLs and Direct
-    # secure-messaging addresses. Sparse, but free signal when present.
-    endpoints = item.get("endpoints", []) or []
-    urls, directs = [], []
-    for e in endpoints:
-        ep = (e.get("endpoint") or "").strip()
-        etype = (e.get("endpointType") or e.get("endpoint_type") or "").upper()
-        if not ep:
-            continue
-        if ep.lower().startswith("http") or "URL" in etype or "WEBSITE" in etype:
-            urls.append(ep)
-        elif "@" in ep:
-            directs.append(ep)
-    urls = list(dict.fromkeys(urls))
-    directs = list(dict.fromkeys(directs))
-
-    org_name = basic.get("organization_name")
-    parent = basic.get("parent_organization_legal_business_name")
-    total_locations = 1 + len(practice_locs)
-
-    # Prospect score: multi-location + growth signals + hearing-aid focus
-    score = 0
-    if total_locations >= 3:
-        score += 50
-    elif total_locations == 2:
-        score += 30
-    if days_since is not None and days_since <= 365:
-        score += 20
-    if pd.notna(last_updated) and (datetime.now() - last_updated).days <= 180:
-        score += 15
-    if tax_codes & HEARING_AID_CODES:
-        score += 10
-
-    return {
-        "NPI": item.get("number"),
-        "Name": org_name or f"{basic.get('first_name', '')} {basic.get('last_name', '')}".strip(),
-        "Organization_Name": org_name,
-        "Parent_Organization": parent,
-        "Is_Subpart": basic.get("organizational_subpart"),
-        "Type": item.get("enumeration_type"),
-        "Status": basic.get("status"),
-        "Total_Locations": total_locations,
-        "Enumeration_Date": enum_date.strftime("%Y-%m-%d") if pd.notna(enum_date) else None,
-        "Days_Since_Opened": days_since,
-        "Last_Updated": last_updated.strftime("%Y-%m-%d") if pd.notna(last_updated) else None,
-        "Record_Freshness": freshness_flag(days_since, last_updated),
-        "State": primary_addr.get("state"),
-        "City": primary_addr.get("city"),
-        "ZIP": (primary_addr.get("postal_code") or "")[:5] or None,
-        "Phone": primary_addr.get("telephone_number"),
-        "Authorized_Official": f"{basic.get('authorized_official_first_name', '')} "
-                               f"{basic.get('authorized_official_last_name', '')}".strip() or None,
-        "Authorized_Official_Title": basic.get("authorized_official_title_or_position"),
-        "Authorized_Official_Phone": basic.get("authorized_official_telephone_number"),
-        "Website_or_URL": "; ".join(urls) or None,
-        "Direct_Address": "; ".join(directs) or None,
-        "Taxonomy_Codes": ", ".join(sorted(tax_codes)),
-        "Matched_Codes": tax_codes & TARGET_CODES,  # set, used for filtering
-        "Primary_Taxonomy": primary_tax.get("desc"),
-        "Sells_Fits_Hearing_Aids": bool(tax_codes & HEARING_AID_CODES),
-        "Prospect_Score": score,
-    }
-
-
-# ------------------------------------------------------------
-# Shared post-processing (used by both search modes)
-# ------------------------------------------------------------
-
-def build_results_df(all_items, strict=False):
-    records = [to_record(it) for it in all_items.values()]
-    # Keep only providers holding at least one of the four target taxonomies
-    records = [r for r in records if r["Matched_Codes"]]
-    df = pd.DataFrame(records)
-    if not df.empty:
-        # Chain grouping: parent org if present, else normalized org name
-        df["Chain_Group"] = df["Parent_Organization"].apply(normalize_org_name)
-        df["Chain_Group"] = df["Chain_Group"].fillna(df["Organization_Name"].apply(normalize_org_name))
-        if strict:
-            # Strict mode: same name AND same authorized official.
-            # Splits generic-name coincidences and franchise brands into
-            # per-owner operators (which is what a "prospect" really is).
-            off = df["Authorized_Official"].fillna("").str.strip().str.upper()
-            df["Chain_Group"] = df["Chain_Group"] + " | " + off
-        chain_sizes = df.groupby("Chain_Group")["NPI"].transform("count")
-        df["Chain_Size"] = chain_sizes.where(df["Chain_Group"].notna(), 1).astype(int)
-        # Total locations across the whole operator (chain group), catching both
-        # one-NPI-many-locations and many-NPIs-one-location-each structures
-        grp_loc = df.groupby("Chain_Group")["Total_Locations"].transform("sum")
-        df["Group_Locations"] = grp_loc.where(df["Chain_Group"].notna(),
-                                              df["Total_Locations"]).astype(int)
-        df.loc[df["Chain_Size"] >= 3, "Prospect_Score"] += 15
-    return df
-
-
-@st.cache_data(ttl=21600, show_spinner=False)  # cache each state for 6h
-def fetch_state_orgs(state_code, wildcard):
-    """All NPI-2 records for one state+wildcard, with automatic cap
-    subdivision by ZIP prefix. Returns (items, still_capped)."""
-    base = {
-        "version": "2.1",
-        "taxonomy_description": wildcard,
-        "enumeration_type": "NPI-2",
-        "state": state_code,
-    }
-    items, capped = _harvest(base)
-    return list(items.values()), capped
-
-
-# ------------------------------------------------------------
-# Sidebar — search inputs
-# ------------------------------------------------------------
-st.sidebar.header("Search")
-
-enum_choice = st.sidebar.selectbox("Entity type", ["Both", "Individual (NPI-1)", "Organization (NPI-2)"])
-ENUM_MAP = {"Both": None, "Individual (NPI-1)": "NPI-1", "Organization (NPI-2)": "NPI-2"}
-
-state = st.sidebar.text_input("State (2-letter, e.g. CA)", max_chars=2).strip().upper()
-city = st.sidebar.text_input("City (optional)").strip()
-postal_code = st.sidebar.text_input("ZIP (optional, partial ok)").strip()
-
-st.sidebar.caption(
-    "The app searches broadly (Hearing*, Audiolog*) and then filters to exact "
-    "taxonomy codes. The API returns at most ~1,200 records per query — for "
-    "national coverage, run once per state."
-)
-
-strict_grouping = st.sidebar.checkbox(
-    "Strict operator grouping", value=True,
-    help="Group records into one operator only when the organization name AND "
-         "the authorized official match. Prevents unrelated same-name clinics "
-         "and franchise brands from merging into fake mega-chains. Untick for "
-         "the looser name-only grouping.",
-)
-
-search_clicked = st.sidebar.button("🔍 Search NPPES", type="primary")
-
-st.sidebar.divider()
-st.sidebar.subheader("🆕 Nationwide shortcut")
-new_days = st.sidebar.selectbox("New organizations in the past…", [30, 60, 90, 180], index=2,
-                                format_func=lambda d: f"{d} days")
-st.sidebar.caption(
-    "Sweeps every state for newly registered NPI-2 organizations. "
-    "First run takes a few minutes; results are cached for 6 hours."
-)
-national_clicked = st.sidebar.button("Find new NPI-2s nationwide")
-
-st.sidebar.subheader("🏢 Multi-location operators")
-multi_threshold = st.sidebar.selectbox("Operator size", [2, 3, 5, 10], index=2,
-                                       format_func=lambda n: f"{n}+ locations")
-st.sidebar.caption(
-    "Finds organizations whose combined locations across their chain group "
-    "meet the threshold. Uses the same cached nationwide sweep."
-)
-multi_clicked = st.sidebar.button("Find multi-location orgs nationwide")
-
-
-def sweep_nationwide_orgs():
-    """Sweep every state for NPI-2 records (cached per state for 6h)."""
-    all_items, capped = {}, []
-    progress = st.progress(0.0, text="Sweeping states for NPI-2 organizations…")
-    total = len(STATES) * len(SEARCH_WILDCARDS)
-    step = 0
-    for st_code in STATES:
-        for wc in SEARCH_WILDCARDS:
-            step += 1
-            progress.progress(step / total, text=f"Checking {st_code} ({wc}) — {step}/{total}")
-            items, hit_cap = fetch_state_orgs(st_code, wc)
-            if hit_cap:
-                capped.append(f"{st_code}/{wc}")
-            for it in items:
-                all_items[it.get("number")] = it
-    progress.empty()
-    return all_items, capped
-
-
-# ------------------------------------------------------------
-# Run search (results persist in session_state)
-# ------------------------------------------------------------
-if search_clicked:
-    status_area = st.empty()
-    all_items, capped_queries = {}, []
-    try:
-        with st.spinner("Querying NPPES Registry…"):
-            for wc in SEARCH_WILDCARDS:
-                items, hit_cap = run_search(
-                    wc, ENUM_MAP[enum_choice], state, city, postal_code, status_area
+            # Chain Detection (Exact + Fuzzy)
+            st.subheader("🔗 Chain Detection")
+            df["Chain_Group"] = df["Parent_Organization"].fillna(df["Organization_Name"])
+            if len(df) > 5:
+                org_names = df["Chain_Group"].dropna().unique()
+                df["Fuzzy_Chain"] = df["Chain_Group"].apply(
+                    lambda x: process.extractOne(x, org_names, score_cutoff=85)[0] if pd.notna(x) else x
                 )
-                if hit_cap:
-                    capped_queries.append(wc)
-                for it in items:
-                    all_items[it.get("number")] = it  # dedupe by NPI
+            chain_col = "Fuzzy_Chain" if "Fuzzy_Chain" in df.columns else "Chain_Group"
 
-        status_area.empty()
-        st.session_state["results_df"] = build_results_df(all_items, strict=strict_grouping)
-        st.session_state["capped"] = capped_queries
-        st.session_state["mode"] = "search"
-    except RuntimeError as e:
-        status_area.empty()
-        st.error(str(e))
+            # Map
+            st.subheader("📍 Locations Map")
+            map_df = df.dropna(subset=["Latitude", "Longitude"])
+            if not map_df.empty:
+                st.map(map_df[["Latitude", "Longitude"]])
+            else:
+                st.info("No coordinates available.")
 
-if national_clicked:
-    try:
-        all_items, capped_states = sweep_nationwide_orgs()
-        df = build_results_df(all_items, strict=strict_grouping)
-        if not df.empty:
-            df = df[df["Days_Since_Opened"].notna() & (df["Days_Since_Opened"] <= new_days)]
-        st.session_state["results_df"] = df.reset_index(drop=True)
-        st.session_state["capped"] = capped_states
-        st.session_state["mode"] = "national_new"
-        st.session_state["national_days"] = new_days
-    except RuntimeError as e:
-        st.error(str(e))
+            # Results Table
+            display_cols = ["NPI", "Name", "Total_Locations", "Prospect_Score", "Chain_Group",
+                           "Enumeration_Date", "Last_Updated", "City", "State", "Phone",
+                           "Authorized_Official", "Authorized_Official_Title"]
 
-if multi_clicked:
-    try:
-        all_items, capped_states = sweep_nationwide_orgs()
-        df = build_results_df(all_items, strict=strict_grouping)
-        if not df.empty:
-            df = df[df["Group_Locations"] >= multi_threshold]
-        st.session_state["results_df"] = df.reset_index(drop=True)
-        st.session_state["capped"] = capped_states
-        st.session_state["mode"] = "national_multi"
-        st.session_state["multi_threshold"] = multi_threshold
-    except RuntimeError as e:
-        st.error(str(e))
-
-# ------------------------------------------------------------
-# Display + interactive filtering (survives reruns)
-# ------------------------------------------------------------
-if "results_df" in st.session_state:
-    df = st.session_state["results_df"]
-    capped = st.session_state.get("capped", [])
-
-    if df.empty:
-        if st.session_state.get("mode") == "national_new":
-            st.warning(f"No new NPI-2 organizations found in the past "
-                       f"{st.session_state.get('national_days', 90)} days.")
-        elif st.session_state.get("mode") == "national_multi":
-            st.warning(f"No operators found with "
-                       f"{st.session_state.get('multi_threshold', 5)}+ locations.")
-        else:
-            st.warning("No matching providers. Try a different state or remove the city/ZIP filter.")
-    else:
-        if st.session_state.get("mode") == "national_new":
-            nd = st.session_state.get("national_days", 90)
-            st.success(f"🆕 {len(df):,} new NPI-2 organizations registered nationwide in the past {nd} days")
-            by_state = (
-                df.groupby("State")
-                .agg(New_Orgs=("NPI", "count"),
-                     Newest=("Enumeration_Date", "max"))
-                .sort_values("New_Orgs", ascending=False)
-            )
-            st.markdown("**New organizations by state:**")
-            st.dataframe(by_state, height=min(420, 40 + 35 * len(by_state)))
-        elif st.session_state.get("mode") == "national_multi":
-            th = st.session_state.get("multi_threshold", 5)
-            n_ops = df["Chain_Group"].nunique()
-            st.success(f"🏢 {n_ops:,} operators with {th}+ locations nationwide "
-                       f"({len(df):,} NPI-2 records)")
-            by_op = (
-                df.groupby("Chain_Group")
-                .agg(Locations=("Group_Locations", "max"),
-                     NPIs=("NPI", "count"),
-                     States=("State", lambda s: ", ".join(sorted(set(s.dropna())))))
-                .sort_values("Locations", ascending=False)
-            )
-            st.markdown("**Operators by size:**")
-            st.dataframe(by_op, height=min(420, 40 + 35 * min(len(by_op), 25)))
-        else:
-            st.success(f"✅ {len(df):,} unique providers with hearing-related taxonomies found")
-        if capped:
-            st.warning(
-                f"Result cap (~1,200) hit for: {', '.join(capped)}. "
-                "Narrow by state/city/ZIP for complete coverage."
+            st.dataframe(
+                df[display_cols].sort_values("Prospect_Score", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Prospect_Score": st.column_config.NumberColumn("Prospect Score (0-85)"),
+                    "Total_Locations": st.column_config.NumberColumn("Locations"),
+                }
             )
 
-        # --- Post-search filters (all client-side, instant) ---
-        st.subheader("🎯 Qualify prospects")
+            # === EXPORTS ===
+            st.subheader("📤 Export Prospects")
 
-        selected_labels = st.multiselect(
-            "Provider types (taxonomy codes)",
-            options=[f"{v} ({k})" for k, v in CODE_LABELS.items()],
-            default=[f"{CODE_LABELS[c]} ({c})" for c in HEARING_AID_CODES],
-        )
-        selected_codes = {lbl.split("(")[-1].rstrip(")") for lbl in selected_labels}
+            col1, col2 = st.columns(2)
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            min_locations = st.slider("Min. locations", 1, 20, 1)
-        with c2:
-            recent_only = st.checkbox("Recently opened only")
-            days_back = st.slider("…within days", 30, 730, 365, step=30, disabled=not recent_only)
-        with c3:
-            min_score = st.slider("Min. prospect score", 0, 100, 0, step=5)
-
-        f = df.copy()
-        if selected_codes:
-            f = f[f["Matched_Codes"].apply(lambda s: bool(s & selected_codes))]
-        if min_locations > 1:
-            f = f[f["Total_Locations"] >= min_locations]
-        if recent_only:
-            f = f[f["Days_Since_Opened"].notna() & (f["Days_Since_Opened"] <= days_back)]
-        if min_score > 0:
-            f = f[f["Prospect_Score"] >= min_score]
-
-        name_q = st.text_input("🔎 Filter by name / organization")
-        if name_q:
-            f = f[f["Name"].str.contains(name_q, case=False, na=False)]
-
-        # --- Chain analysis ---
-        st.subheader("🔗 Chains & common ownership")
-        chains = (
-            f[f["Chain_Group"].notna()]
-            .groupby("Chain_Group")
-            .agg(
-                NPIs=("NPI", "count"),
-                Group_Locations=("Group_Locations", "max"),
-                States=("State", lambda s: ", ".join(sorted(set(s.dropna())))),
-            )
-            .sort_values("Group_Locations", ascending=False)
-        )
-        multi = chains[chains["NPIs"] >= 2]
-        if not multi.empty:
-            st.markdown(f"**{len(multi)}** groups with 2+ NPIs in these results:")
-            st.dataframe(multi.head(25))
-
-            # --- Exclusions: remove whales/franchises from the prospect list ---
-            exc1, exc2, exc3 = st.columns([2, 1, 1])
-            with exc1:
-                excluded_ops = st.multiselect(
-                    "🚫 Exclude these operators from the prospect list",
-                    options=sorted(multi.index.tolist()),
-                    key="excluded_operators",
-                    help="Pick franchise brands or whales you don't want in the "
-                         "qualified list, table, or exports.",
-                )
-            with exc2:
-                exclude_big = st.checkbox("Auto-exclude operators over…",
-                                          key="exclude_big")
-            with exc3:
-                big_cutoff = st.number_input("locations", min_value=5, max_value=2000,
-                                             value=50, step=5, key="big_cutoff",
-                                             disabled=not exclude_big)
-
-            before_exc = len(f)
-            if excluded_ops:
-                f = f[~f["Chain_Group"].isin(excluded_ops)]
-            if exclude_big:
-                f = f[f["Group_Locations"] <= big_cutoff]
-            n_excluded = before_exc - len(f)
-            if n_excluded:
-                st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
-
-            pick = st.selectbox("Drill into a chain", ["(all)"] + sorted(multi.index.tolist()))
-            if pick != "(all)":
-                f = f[f["Chain_Group"] == pick]
-        else:
-            st.info("No multi-NPI groups detected in the current filtered set.")
-
-        # --- Optional map via ZIP centroids (API provides no coordinates) ---
-        with st.expander("📍 Map (approximate, by ZIP code)"):
-            if st.checkbox("Load map", help="Downloads a ZIP-code lookup table on first use"):
-                @st.cache_data(show_spinner="Loading ZIP coordinate data…")
-                def zip_coords(zips_tuple):
-                    import pgeocode
-                    nomi = pgeocode.Nominatim("us")
-                    geo = nomi.query_postal_code(list(zips_tuple))[
-                        ["postal_code", "latitude", "longitude"]
-                    ]
-                    return geo.rename(columns={"postal_code": "ZIP"})
-
-                try:
-                    zips = tuple(sorted(f["ZIP"].dropna().unique()))
-                    if zips:
-                        m = f.merge(zip_coords(zips), on="ZIP", how="left").dropna(
-                            subset=["latitude", "longitude"]
-                        )
-                        if not m.empty:
-                            st.map(m[["latitude", "longitude"]])
-                            st.caption("Pins are ZIP-code centroids — NPPES does not publish exact coordinates.")
-                        else:
-                            st.info("No mappable ZIPs in the current results.")
-                except Exception:
-                    st.info("Map unavailable (ZIP lookup download failed on this host).")
-
-        # --- Results table with row selection ---
-        st.subheader(f"📋 {len(f):,} qualified prospects")
-        show_cols = [
-            "Prospect_Score", "Name", "Total_Locations", "Chain_Size", "Group_Locations", "Type",
-            "Record_Freshness", "Enumeration_Date", "Last_Updated", "City", "State", "ZIP", "Phone",
-            "Authorized_Official", "Authorized_Official_Title", "Authorized_Official_Phone",
-            "Website_or_URL", "Direct_Address",
-            "Primary_Taxonomy", "Taxonomy_Codes", "NPI",
-        ]
-
-        if "selected_npis" not in st.session_state:
-            st.session_state["selected_npis"] = set()
-        if "sel_nonce" not in st.session_state:
-            st.session_state["sel_nonce"] = 0
-
-        f_sorted = f.sort_values(
-            ["Prospect_Score", "Total_Locations"], ascending=False
-        ).reset_index(drop=True)
-        visible_npis = f_sorted["NPI"].tolist()
-
-        b1, b2, b3 = st.columns([1, 1, 2])
-        with b1:
-            if st.button("✅ Select all"):
-                st.session_state["selected_npis"] |= set(visible_npis)
-                st.session_state["sel_nonce"] += 1
-        with b2:
-            if st.button("⬜ Clear selection"):
-                st.session_state["selected_npis"] -= set(visible_npis)
-                st.session_state["sel_nonce"] += 1
-
-        table = f_sorted[show_cols].copy()
-        table.insert(0, "Select", f_sorted["NPI"].isin(st.session_state["selected_npis"]))
-
-        key_sig = hashlib.md5(",".join(map(str, visible_npis)).encode()).hexdigest()[:10]
-        edited = st.data_editor(
-            table,
-            hide_index=True,
-            disabled=show_cols,  # only the Select checkbox is editable
-            column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-            key=f"prospect_editor_{st.session_state['sel_nonce']}_{key_sig}",
-        )
-        # Sync ticked rows back into the persistent, NPI-keyed selection set
-        sel_now = set(edited.loc[edited["Select"], "NPI"])
-        st.session_state["selected_npis"] = (
-            st.session_state["selected_npis"] - set(visible_npis)
-        ) | sel_now
-        n_sel = len(st.session_state["selected_npis"] & set(visible_npis))
-        with b3:
-            st.markdown(f"**{n_sel}** of {len(f_sorted)} rows selected")
-
-        # --- Exports ---
-        st.subheader("📤 Export")
-        sel_set = st.session_state.get("selected_npis", set()) & set(visible_npis)
-        scope = st.radio(
-            "Rows to export",
-            [f"All filtered rows ({len(f_sorted)})", f"Selected rows only ({len(sel_set)})"],
-            horizontal=True,
-        )
-        use_selected = scope.startswith("Selected")
-        if use_selected and not sel_set:
-            st.info("No rows selected yet — tick rows in the table above or use ✅ Select all.")
-
-        exp_base = f_sorted[f_sorted["NPI"].isin(sel_set)] if use_selected else f_sorted
-
-        st.caption("💡 For verified websites and email addresses, run the downloaded file "
-                   "through the local enrichment pipeline (enrich_prospects.py) — it resolves "
-                   "each business via Google Places before looking up any emails.")
-
-        if st.button("⚙️ Prepare export", disabled=(use_selected and not sel_set)):
-            exp = exp_base.drop(columns=["Matched_Codes"], errors="ignore").copy()
-
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                exp.to_excel(writer, index=False, sheet_name="Prospects")
-            buf.seek(0)
-            st.session_state["export_pkg"] = {
-                "csv": exp.to_csv(index=False).encode("utf-8"),
-                "xlsx": buf.getvalue(),
-                "n": len(exp),
-                "stamp": datetime.now().strftime("%Y%m%d_%H%M"),
-            }
-
-        pkg = st.session_state.get("export_pkg")
-        if pkg:
-            st.markdown(f"Export ready: **{pkg['n']} rows**")
-            e1, e2 = st.columns(2)
-            with e1:
+            with col1:
+                csv = df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    "Download CSV",
-                    pkg["csv"],
-                    file_name=f"hearing_aid_prospects_{pkg['stamp']}.csv",
-                    mime="text/csv",
+                    label="📥 Download CSV",
+                    data=csv,
+                    file_name=f"hearing_aid_prospects_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
                 )
-            with e2:
+
+            with col2:
+                # Excel Download using BytesIO
+                buffer = pd.io.common.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Hearing Aid Prospects')
+                buffer.seek(0)
+
                 st.download_button(
-                    "Download Excel (.xlsx)",
-                    pkg["xlsx"],
-                    file_name=f"hearing_aid_prospects_{pkg['stamp']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    label="📥 Download Excel (.xlsx)",
+                    data=buffer,
+                    file_name=f"hearing_aid_prospects_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+
+        else:
+            st.warning("No results found with current filters.")
+
 else:
-    st.info("👈 Pick a state (recommended) and click **Search NPPES**. Provider-type filtering happens after the search, instantly.")
+    st.info("👈 Use the sidebar to find multi-location hearing aid clinics that are strong prospects for your practice management platform.")
 
-st.caption(
-    "Data: official NPPES NPI Registry API v2.1 • Broad wildcard search + exact taxonomy-code "
-    "filtering • Each API query caps at ~1,200 records • NPI enumeration date ≈ proxy for opening date"
-)
+st.caption("Focused on hearing aid fitting/sales providers • Prospect scoring based on locations + growth signals • Data from official NPPES API")
