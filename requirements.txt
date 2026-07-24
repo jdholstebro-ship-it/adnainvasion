@@ -2,4 +2,5 @@ streamlit
 requests
 pandas
 openpyxl
-pgeocode
+thefuzz
+python-Levenshtein
