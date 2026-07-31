@@ -576,11 +576,10 @@ if "results_df" in st.session_state:
                         seen.append(v)
                 return "; ".join(seen)
 
-            def _most_frequent_addr(series):
+            def _most_frequent(series):
                 vals = [str(v).strip() for v in series.dropna() if str(v).strip()]
                 if not vals:
                     return None
-                # mode; ties broken by first occurrence (Counter preserves insertion order)
                 from collections import Counter
                 counts = Counter(vals)
                 top = max(counts.values())
@@ -589,19 +588,25 @@ if "results_df" in st.session_state:
                         return v
                 return vals[0]
 
+            _most_frequent_addr = _most_frequent  # same mode logic, kept name for clarity
+
             by_op = (
                 df.groupby("Chain_Group")
                 .agg(
+                    Operator=("Organization_Name", _most_frequent),
                     Authorized_Official=("Authorized_Official", _join_distinct),
-                    Authorized_Official_Title=("Authorized_Official_Title", _join_distinct),
+                    Authorized_Official_Title=("Authorized_Official_Title", _most_frequent),
                     Primary_Practice_Address=("Primary_Practice_Address", _most_frequent_addr),
                     Locations=("Group_Locations", "max"),
                     NPIs=("NPI", "count"),
                     States=("State", lambda s: ", ".join(sorted(set(s.dropna())))),
                 )
                 .sort_values("Locations", ascending=False)
-                .reset_index()
-                .rename(columns={"Chain_Group": "Operator"})
+                .reset_index()   # keeps Chain_Group as the identity key column
+            )
+            # Fall back to the group key's name part if Organization_Name was blank
+            by_op["Operator"] = by_op["Operator"].fillna(
+                by_op["Chain_Group"].str.split(" | ", regex=False).str[0]
             )
 
             st.markdown("**Operators by size:** tick **Exclude** to drop an operator "
@@ -613,24 +618,33 @@ if "results_df" in st.session_state:
             if "op_excl_nonce" not in st.session_state:
                 st.session_state["op_excl_nonce"] = 0
 
-            op_names = by_op["Operator"].tolist()
+            # Identity for exclusion is the Chain_Group KEY (matches the
+            # downstream prospect filter, which excludes on Chain_Group). The
+            # visible "Operator" column is a clean display name only.
+            op_keys = by_op["Chain_Group"].tolist()
             eb1, eb2, eb3 = st.columns([1, 1, 2])
             with eb1:
                 if st.button("🚫 Exclude all"):
-                    st.session_state["excluded_operators_set"] |= set(op_names)
+                    st.session_state["excluded_operators_set"] |= set(op_keys)
                     st.session_state["op_excl_nonce"] += 1
             with eb2:
                 if st.button("↩️ Clear exclusions"):
-                    st.session_state["excluded_operators_set"] -= set(op_names)
+                    st.session_state["excluded_operators_set"] -= set(op_keys)
                     st.session_state["op_excl_nonce"] += 1
 
             op_table = by_op.copy()
             op_table.insert(
                 0, "Exclude",
-                op_table["Operator"].isin(st.session_state["excluded_operators_set"]),
+                op_table["Chain_Group"].isin(st.session_state["excluded_operators_set"]),
             )
+            # Column order: Exclude, Operator (display), then details; Chain_Group
+            # rides along as the hidden identity key (not shown to the user).
+            display_order = ["Exclude", "Operator", "Authorized_Official",
+                             "Authorized_Official_Title", "Primary_Practice_Address",
+                             "Locations", "NPIs", "States", "Chain_Group"]
+            op_table = op_table[[c for c in display_order if c in op_table.columns]]
             op_disabled = [c for c in op_table.columns if c != "Exclude"]
-            op_sig = hashlib.md5(",".join(map(str, op_names)).encode()).hexdigest()[:10]
+            op_sig = hashlib.md5(",".join(map(str, op_keys)).encode()).hexdigest()[:10]
             op_edited = st.data_editor(
                 op_table,
                 hide_index=True,
@@ -639,24 +653,27 @@ if "results_df" in st.session_state:
                     "Exclude": st.column_config.CheckboxColumn("Exclude", default=False),
                     "Operator": st.column_config.TextColumn("Operator"),
                     "Authorized_Official": st.column_config.TextColumn("Official(s)"),
-                    "Authorized_Official_Title": st.column_config.TextColumn("Title(s)"),
+                    "Authorized_Official_Title": st.column_config.TextColumn("Title"),
                     "Primary_Practice_Address": st.column_config.TextColumn("Primary practice address"),
+                    "Chain_Group": None,   # hide the identity key from view
                 },
                 height=min(600, 40 + 35 * min(len(op_table), 30)),
                 key=f"op_excl_editor_{st.session_state['op_excl_nonce']}_{op_sig}",
             )
-            # Sync ticked operators back into the persistent set
-            excl_now = set(op_edited.loc[op_edited["Exclude"], "Operator"])
+            # Sync ticked operators (by Chain_Group key) into the persistent set
+            excl_now = set(op_edited.loc[op_edited["Exclude"], "Chain_Group"])
             st.session_state["excluded_operators_set"] = (
-                st.session_state["excluded_operators_set"] - set(op_names)
+                st.session_state["excluded_operators_set"] - set(op_keys)
             ) | excl_now
-            n_excl = len(st.session_state["excluded_operators_set"] & set(op_names))
+            n_excl = len(st.session_state["excluded_operators_set"] & set(op_keys))
             with eb3:
-                st.markdown(f"**{n_excl}** of {len(op_names)} operators excluded")
+                st.markdown(f"**{n_excl}** of {len(op_keys)} operators excluded")
 
             # ---- Export of the operator summary (non-excluded only) ----
-            keep_mask = ~op_edited["Operator"].isin(st.session_state["excluded_operators_set"])
-            op_export = op_edited.loc[keep_mask].drop(columns=["Exclude"]).reset_index(drop=True)
+            keep_mask = ~op_edited["Chain_Group"].isin(st.session_state["excluded_operators_set"])
+            op_export = (op_edited.loc[keep_mask]
+                         .drop(columns=["Exclude", "Chain_Group"])
+                         .reset_index(drop=True))
             st.caption(f"Operator summary export includes **{len(op_export)}** non-excluded operators.")
             if st.button("⚙️ Prepare operator-summary export"):
                 obuf = io.BytesIO()
