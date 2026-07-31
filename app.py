@@ -568,6 +568,9 @@ if "results_df" in st.session_state:
                        f"({len(df):,} NPI-2 records)")
 
             # ---- Aggregations per operator (one row per Chain_Group) ----
+            # Memoized: this depends only on the search-result df, NOT on the
+            # exclusion checkboxes, so we compute it once per result set and
+            # reuse it across the many reruns that ticking causes.
             def _join_distinct(series):
                 seen = []
                 for v in series.dropna():
@@ -590,52 +593,72 @@ if "results_df" in st.session_state:
 
             _most_frequent_addr = _most_frequent  # same mode logic, kept name for clarity
 
-            by_op = (
-                df.groupby("Chain_Group")
-                .agg(
-                    Operator=("Organization_Name", _most_frequent),
-                    Authorized_Official=("Authorized_Official", _join_distinct),
-                    Authorized_Official_Title=("Authorized_Official_Title", _most_frequent),
-                    Primary_Practice_Address=("Primary_Practice_Address", _most_frequent_addr),
-                    Locations=("Group_Locations", "max"),
-                    NPIs=("NPI", "count"),
-                    States=("State", lambda s: ", ".join(sorted(set(s.dropna())))),
+            # Signature of the current result set (cheap): row count + a hash of
+            # the sorted NPI list. Changes only when a new search/sweep runs.
+            _op_cache_sig = hashlib.md5(
+                (str(len(df)) + "|" + ",".join(sorted(df["NPI"].astype(str))))
+                .encode()
+            ).hexdigest()
+
+            if st.session_state.get("by_op_sig") == _op_cache_sig \
+                    and "by_op_cached" in st.session_state:
+                by_op = st.session_state["by_op_cached"]
+            else:
+                by_op = (
+                    df.groupby("Chain_Group")
+                    .agg(
+                        Operator=("Organization_Name", _most_frequent),
+                        Authorized_Official=("Authorized_Official", _join_distinct),
+                        Authorized_Official_Title=("Authorized_Official_Title", _most_frequent),
+                        Primary_Practice_Address=("Primary_Practice_Address", _most_frequent_addr),
+                        Locations=("Group_Locations", "max"),
+                        NPIs=("NPI", "count"),
+                        States=("State", lambda s: ", ".join(sorted(set(s.dropna())))),
+                    )
+                    .sort_values("Locations", ascending=False)
+                    .reset_index()   # keeps Chain_Group as the identity key column
                 )
-                .sort_values("Locations", ascending=False)
-                .reset_index()   # keeps Chain_Group as the identity key column
-            )
-            # Fall back to the group key's name part if Organization_Name was blank
-            by_op["Operator"] = by_op["Operator"].fillna(
-                by_op["Chain_Group"].str.split(" | ", regex=False).str[0]
-            )
+                # Fall back to the group key's name part if Organization_Name was blank
+                by_op["Operator"] = by_op["Operator"].fillna(
+                    by_op["Chain_Group"].str.split(" | ", regex=False).str[0]
+                )
+                st.session_state["by_op_cached"] = by_op
+                st.session_state["by_op_sig"] = _op_cache_sig
 
-            st.markdown("**Operators by size:** tick **Exclude** to drop an operator "
-                        "from every table and export below.")
+            st.markdown("**Operators by size:** tick **Exclude** to stage operators, "
+                        "then click **Apply exclusions** to update the prospect list, "
+                        "map, and exports below. Ticking is instant; nothing downstream "
+                        "recomputes until you apply.")
 
-            # Persistent, operator-keyed exclusion set (survives reruns via nonce)
-            if "excluded_operators_set" not in st.session_state:
-                st.session_state["excluded_operators_set"] = set()
+            # Two-tier exclusion state:
+            #   excluded_pending  — updated live as you tick (cheap; no downstream recompute)
+            #   excluded_applied  — what the prospect list/map/exports actually use;
+            #                       only changes when you click "Apply exclusions".
+            if "excluded_pending" not in st.session_state:
+                st.session_state["excluded_pending"] = set()
+            if "excluded_applied" not in st.session_state:
+                st.session_state["excluded_applied"] = set()
             if "op_excl_nonce" not in st.session_state:
                 st.session_state["op_excl_nonce"] = 0
 
             # Identity for exclusion is the Chain_Group KEY (matches the
-            # downstream prospect filter, which excludes on Chain_Group). The
-            # visible "Operator" column is a clean display name only.
+            # downstream prospect filter). The visible "Operator" column is a
+            # clean display name only.
             op_keys = by_op["Chain_Group"].tolist()
             eb1, eb2, eb3 = st.columns([1, 1, 2])
             with eb1:
-                if st.button("🚫 Exclude all"):
-                    st.session_state["excluded_operators_set"] |= set(op_keys)
+                if st.button("🚫 Exclude all (stage)"):
+                    st.session_state["excluded_pending"] |= set(op_keys)
                     st.session_state["op_excl_nonce"] += 1
             with eb2:
-                if st.button("↩️ Clear exclusions"):
-                    st.session_state["excluded_operators_set"] -= set(op_keys)
+                if st.button("↩️ Clear staged"):
+                    st.session_state["excluded_pending"] -= set(op_keys)
                     st.session_state["op_excl_nonce"] += 1
 
             op_table = by_op.copy()
             op_table.insert(
                 0, "Exclude",
-                op_table["Chain_Group"].isin(st.session_state["excluded_operators_set"]),
+                op_table["Chain_Group"].isin(st.session_state["excluded_pending"]),
             )
             # Column order: Exclude, Operator (display), then details; Chain_Group
             # rides along as the hidden identity key (not shown to the user).
@@ -660,17 +683,29 @@ if "results_df" in st.session_state:
                 height=min(600, 40 + 35 * min(len(op_table), 30)),
                 key=f"op_excl_editor_{st.session_state['op_excl_nonce']}_{op_sig}",
             )
-            # Sync ticked operators (by Chain_Group key) into the persistent set
+            # Sync ticked operators into the PENDING set (live, cheap — this does
+            # NOT touch the applied set, so nothing downstream recomputes yet).
             excl_now = set(op_edited.loc[op_edited["Exclude"], "Chain_Group"])
-            st.session_state["excluded_operators_set"] = (
-                st.session_state["excluded_operators_set"] - set(op_keys)
+            st.session_state["excluded_pending"] = (
+                st.session_state["excluded_pending"] - set(op_keys)
             ) | excl_now
-            n_excl = len(st.session_state["excluded_operators_set"] & set(op_keys))
-            with eb3:
-                st.markdown(f"**{n_excl}** of {len(op_keys)} operators excluded")
 
-            # ---- Export of the operator summary (non-excluded only) ----
-            keep_mask = ~op_edited["Chain_Group"].isin(st.session_state["excluded_operators_set"])
+            pending = st.session_state["excluded_pending"]
+            applied = st.session_state["excluded_applied"]
+            n_pending = len(pending & set(op_keys))
+            dirty = (pending != applied)
+
+            with eb3:
+                if st.button("✅ Apply exclusions", type="primary", disabled=not dirty):
+                    st.session_state["excluded_applied"] = set(pending)
+                    st.rerun()
+                st.markdown(f"**{n_pending}** staged · **{len(applied)}** applied")
+            if dirty:
+                st.info("⚠️ You have unapplied exclusion changes — click **Apply exclusions** "
+                        "to update the prospect list and exports below.")
+
+            # ---- Export of the operator summary (non-excluded per APPLIED set) ----
+            keep_mask = ~op_edited["Chain_Group"].isin(st.session_state["excluded_applied"])
             op_export = (op_edited.loc[keep_mask]
                          .drop(columns=["Exclude", "Chain_Group"])
                          .reset_index(drop=True))
@@ -788,7 +823,7 @@ if "results_df" in st.session_state:
                                              value=50, step=5, key="big_cutoff",
                                              disabled=not exclude_big)
 
-            excluded_ops_set = st.session_state.get("excluded_operators_set", set())
+            excluded_ops_set = st.session_state.get("excluded_applied", set())
             before_exc = len(f)
             if excluded_ops_set:
                 f = f[~f["Chain_Group"].isin(excluded_ops_set)]
@@ -806,7 +841,7 @@ if "results_df" in st.session_state:
                 f = f[f["Chain_Group"] == pick]
         else:
             # No multi-NPI chains, but operator-checkbox and DBA exclusions still apply.
-            excluded_ops_set = st.session_state.get("excluded_operators_set", set())
+            excluded_ops_set = st.session_state.get("excluded_applied", set())
             before_exc = len(f)
             if excluded_ops_set:
                 f = f[~f["Chain_Group"].isin(excluded_ops_set)]
