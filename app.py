@@ -239,6 +239,22 @@ def to_record(item):
         addresses[0] if addresses else {},
     )
 
+    # Combined primary practice address (LOCATION purpose), for display/export.
+    # Format: "line1 [line2], city, ST 12345"
+    def _addr_str(a):
+        if not a:
+            return None
+        line1 = (a.get("address_1") or "").strip()
+        line2 = (a.get("address_2") or "").strip()
+        city_ = (a.get("city") or "").strip()
+        st_ = (a.get("state") or "").strip()
+        zip_ = (a.get("postal_code") or "")[:5].strip()
+        street = " ".join(p for p in [line1, line2] if p)
+        locality = ", ".join(p for p in [city_, f"{st_} {zip_}".strip()] if p)
+        full = ", ".join(p for p in [street, locality] if p)
+        return full or None
+    primary_practice_address = _addr_str(primary_addr)
+
     # DBA / other names: NPPES returns a list of {organization_name, type, code}
     dba_list = [o.get("organization_name") for o in other_names if o.get("organization_name")]
     dba_name = "; ".join(dict.fromkeys(dba_list)) if dba_list else None
@@ -300,6 +316,7 @@ def to_record(item):
         "State": primary_addr.get("state"),
         "City": primary_addr.get("city"),
         "ZIP": (primary_addr.get("postal_code") or "")[:5] or None,
+        "Primary_Practice_Address": primary_practice_address,
         "Phone": primary_addr.get("telephone_number"),
         "Authorized_Official": f"{basic.get('authorized_official_first_name', '')} "
                                f"{basic.get('authorized_official_last_name', '')}".strip() or None,
@@ -416,11 +433,12 @@ st.sidebar.caption(
 national_clicked = st.sidebar.button("Find new NPI-2s nationwide")
 
 st.sidebar.subheader("🏢 Multi-location operators")
-multi_threshold = st.sidebar.selectbox("Operator size", [2, 3, 5, 10], index=2,
-                                       format_func=lambda n: f"{n}+ locations")
+multi_threshold = st.sidebar.selectbox("Operator size", [1, 2, 3, 5, 10], index=1,
+                                       format_func=lambda n: f"{n}+ location" + ("s" if n > 1 else ""))
 st.sidebar.caption(
     "Finds organizations whose combined locations across their chain group "
-    "meet the threshold. Uses the same cached nationwide sweep."
+    "meet the threshold. Set to 1 to return all hearing-aid organizations "
+    "nationwide (no location filter). Uses the same cached nationwide sweep."
 )
 multi_clicked = st.sidebar.button("Find multi-location orgs nationwide")
 
@@ -546,17 +564,128 @@ if "results_df" in st.session_state:
         elif st.session_state.get("mode") == "national_multi":
             th = st.session_state.get("multi_threshold", 5)
             n_ops = df["Chain_Group"].nunique()
-            st.success(f"🏢 {n_ops:,} operators with {th}+ locations nationwide "
+            st.success(f"🏢 {n_ops:,} operators with {th}+ location{'s' if th > 1 else ''} nationwide "
                        f"({len(df):,} NPI-2 records)")
+
+            # ---- Aggregations per operator (one row per Chain_Group) ----
+            def _join_distinct(series):
+                seen = []
+                for v in series.dropna():
+                    v = str(v).strip()
+                    if v and v not in seen:
+                        seen.append(v)
+                return "; ".join(seen)
+
+            def _most_frequent_addr(series):
+                vals = [str(v).strip() for v in series.dropna() if str(v).strip()]
+                if not vals:
+                    return None
+                # mode; ties broken by first occurrence (Counter preserves insertion order)
+                from collections import Counter
+                counts = Counter(vals)
+                top = max(counts.values())
+                for v in vals:               # first value achieving the top count
+                    if counts[v] == top:
+                        return v
+                return vals[0]
+
             by_op = (
                 df.groupby("Chain_Group")
-                .agg(Locations=("Group_Locations", "max"),
-                     NPIs=("NPI", "count"),
-                     States=("State", lambda s: ", ".join(sorted(set(s.dropna())))))
+                .agg(
+                    Authorized_Official=("Authorized_Official", _join_distinct),
+                    Authorized_Official_Title=("Authorized_Official_Title", _join_distinct),
+                    Primary_Practice_Address=("Primary_Practice_Address", _most_frequent_addr),
+                    Locations=("Group_Locations", "max"),
+                    NPIs=("NPI", "count"),
+                    States=("State", lambda s: ", ".join(sorted(set(s.dropna())))),
+                )
                 .sort_values("Locations", ascending=False)
+                .reset_index()
+                .rename(columns={"Chain_Group": "Operator"})
             )
-            st.markdown("**Operators by size:**")
-            st.dataframe(by_op, height=min(420, 40 + 35 * min(len(by_op), 25)))
+
+            st.markdown("**Operators by size:** tick **Exclude** to drop an operator "
+                        "from every table and export below.")
+
+            # Persistent, operator-keyed exclusion set (survives reruns via nonce)
+            if "excluded_operators_set" not in st.session_state:
+                st.session_state["excluded_operators_set"] = set()
+            if "op_excl_nonce" not in st.session_state:
+                st.session_state["op_excl_nonce"] = 0
+
+            op_names = by_op["Operator"].tolist()
+            eb1, eb2, eb3 = st.columns([1, 1, 2])
+            with eb1:
+                if st.button("🚫 Exclude all"):
+                    st.session_state["excluded_operators_set"] |= set(op_names)
+                    st.session_state["op_excl_nonce"] += 1
+            with eb2:
+                if st.button("↩️ Clear exclusions"):
+                    st.session_state["excluded_operators_set"] -= set(op_names)
+                    st.session_state["op_excl_nonce"] += 1
+
+            op_table = by_op.copy()
+            op_table.insert(
+                0, "Exclude",
+                op_table["Operator"].isin(st.session_state["excluded_operators_set"]),
+            )
+            op_disabled = [c for c in op_table.columns if c != "Exclude"]
+            op_sig = hashlib.md5(",".join(map(str, op_names)).encode()).hexdigest()[:10]
+            op_edited = st.data_editor(
+                op_table,
+                hide_index=True,
+                disabled=op_disabled,   # only Exclude is editable
+                column_config={
+                    "Exclude": st.column_config.CheckboxColumn("Exclude", default=False),
+                    "Operator": st.column_config.TextColumn("Operator"),
+                    "Authorized_Official": st.column_config.TextColumn("Official(s)"),
+                    "Authorized_Official_Title": st.column_config.TextColumn("Title(s)"),
+                    "Primary_Practice_Address": st.column_config.TextColumn("Primary practice address"),
+                },
+                height=min(600, 40 + 35 * min(len(op_table), 30)),
+                key=f"op_excl_editor_{st.session_state['op_excl_nonce']}_{op_sig}",
+            )
+            # Sync ticked operators back into the persistent set
+            excl_now = set(op_edited.loc[op_edited["Exclude"], "Operator"])
+            st.session_state["excluded_operators_set"] = (
+                st.session_state["excluded_operators_set"] - set(op_names)
+            ) | excl_now
+            n_excl = len(st.session_state["excluded_operators_set"] & set(op_names))
+            with eb3:
+                st.markdown(f"**{n_excl}** of {len(op_names)} operators excluded")
+
+            # ---- Export of the operator summary (non-excluded only) ----
+            keep_mask = ~op_edited["Operator"].isin(st.session_state["excluded_operators_set"])
+            op_export = op_edited.loc[keep_mask].drop(columns=["Exclude"]).reset_index(drop=True)
+            st.caption(f"Operator summary export includes **{len(op_export)}** non-excluded operators.")
+            if st.button("⚙️ Prepare operator-summary export"):
+                obuf = io.BytesIO()
+                with pd.ExcelWriter(obuf, engine="openpyxl") as writer:
+                    op_export.to_excel(writer, index=False, sheet_name="Operators")
+                obuf.seek(0)
+                st.session_state["op_export_pkg"] = {
+                    "csv": op_export.to_csv(index=False).encode("utf-8"),
+                    "xlsx": obuf.getvalue(),
+                    "n": len(op_export),
+                    "stamp": datetime.now().strftime("%Y%m%d_%H%M"),
+                }
+            opkg = st.session_state.get("op_export_pkg")
+            if opkg:
+                st.markdown(f"Operator summary ready: **{opkg['n']} operators**")
+                oc1, oc2 = st.columns(2)
+                with oc1:
+                    st.download_button(
+                        "Download operators CSV", opkg["csv"],
+                        file_name=f"hearing_aid_operators_{opkg['stamp']}.csv",
+                        mime="text/csv", key="op_csv_dl",
+                    )
+                with oc2:
+                    st.download_button(
+                        "Download operators Excel (.xlsx)", opkg["xlsx"],
+                        file_name=f"hearing_aid_operators_{opkg['stamp']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="op_xlsx_dl",
+                    )
         else:
             st.success(f"✅ {len(df):,} unique providers with hearing-related taxonomies found")
         if capped:
@@ -628,15 +757,12 @@ if "results_df" in st.session_state:
             st.dataframe(multi.head(25))
 
             # --- Exclusions: remove whales/franchises from the prospect list ---
-            exc1, exc2, exc3 = st.columns([2, 1, 1])
-            with exc1:
-                excluded_ops = st.multiselect(
-                    "🚫 Exclude these operators from the prospect list",
-                    options=sorted(multi.index.tolist()),
-                    key="excluded_operators",
-                    help="Pick franchise brands or whales you don't want in the "
-                         "qualified list, table, or exports.",
-                )
+            # Operator-level exclusion is driven by the Exclude checkboxes in the
+            # "Operators by size" table (national_multi mode). That set is the
+            # single source of truth and is applied here to every downstream
+            # table, map, and export. The DBA and auto-exclude-big controls
+            # remain as independent, stacking filters.
+            exc2, exc3 = st.columns([1, 1])
             with exc2:
                 exclude_big = st.checkbox("Auto-exclude operators over…",
                                           key="exclude_big")
@@ -645,28 +771,33 @@ if "results_df" in st.session_state:
                                              value=50, step=5, key="big_cutoff",
                                              disabled=not exclude_big)
 
+            excluded_ops_set = st.session_state.get("excluded_operators_set", set())
             before_exc = len(f)
-            if excluded_ops:
-                f = f[~f["Chain_Group"].isin(excluded_ops)]
+            if excluded_ops_set:
+                f = f[~f["Chain_Group"].isin(excluded_ops_set)]
             if exclude_big:
                 f = f[f["Group_Locations"] <= big_cutoff]
             if excluded_dbas:
                 f = f[~f["DBA_Name"].isin(excluded_dbas)]
             n_excluded = before_exc - len(f)
             if n_excluded:
-                st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
+                st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below "
+                           "(operator checkboxes + DBA + size filters).")
 
             pick = st.selectbox("Drill into a chain", ["(all)"] + sorted(multi.index.tolist()))
             if pick != "(all)":
                 f = f[f["Chain_Group"] == pick]
         else:
-            # No multi-NPI chains, but DBA exclusion may still apply.
+            # No multi-NPI chains, but operator-checkbox and DBA exclusions still apply.
+            excluded_ops_set = st.session_state.get("excluded_operators_set", set())
+            before_exc = len(f)
+            if excluded_ops_set:
+                f = f[~f["Chain_Group"].isin(excluded_ops_set)]
             if excluded_dbas:
-                before_exc = len(f)
                 f = f[~f["DBA_Name"].isin(excluded_dbas)]
-                n_excluded = before_exc - len(f)
-                if n_excluded:
-                    st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
+            n_excluded = before_exc - len(f)
+            if n_excluded:
+                st.caption(f"🚫 {n_excluded:,} records excluded from the prospect list below.")
             st.info("No multi-NPI groups detected in the current filtered set.")
 
         # --- Optional map via ZIP centroids (API provides no coordinates) ---
@@ -700,7 +831,8 @@ if "results_df" in st.session_state:
         show_cols = [
             "Prospect_Score", "Name", "DBA_Name", "Total_Locations", "Chain_Size", "Group_Locations",
             "Multi_State_Operator", "Operating_States", "Type",
-            "Record_Freshness", "Enumeration_Date", "Last_Updated", "City", "State", "ZIP", "Phone",
+            "Record_Freshness", "Enumeration_Date", "Last_Updated", "City", "State", "ZIP",
+            "Primary_Practice_Address", "Phone",
             "Authorized_Official", "Authorized_Official_Title", "Authorized_Official_Phone",
             "Website_or_URL", "Direct_Address",
             "Primary_Taxonomy", "Taxonomy_Codes", "NPI",
